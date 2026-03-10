@@ -3,6 +3,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 import math
+from geometry_msgs.msg import Point
 
 class DecentralizedAgent(Node):
     def __init__(self):
@@ -15,6 +16,8 @@ class DecentralizedAgent(Node):
         self.robot_name = self.get_parameter('robot_name').value
         self.goal_x = self.get_parameter('goal_x').value
         self.goal_y = self.get_parameter('goal_y').value
+
+        self.force_pub = self.create_publisher(Point, f'/{self.robot_name}/force_vector', 10)
 
         self.x = 0.0
         self.y = 0.0
@@ -120,6 +123,14 @@ class DecentralizedAgent(Node):
         
         if cmd.linear.x < 0:
             cmd.linear.x = 0.0
+        
+
+        
+        force_msg = Point()
+        force_msg.x = fx
+        force_msg.y = fy
+        force_msg.z = 0.0
+        self.force_pub.publish(force_msg)
 
         self.cmd_pub.publish(cmd)
 

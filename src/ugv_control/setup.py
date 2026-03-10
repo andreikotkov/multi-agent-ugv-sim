@@ -12,7 +12,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # ADD THIS LINE TO INSTALL LAUNCH FILES:
+        
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
@@ -24,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'single_agent_node = ugv_control.single_agent_node:main'
+            'single_agent_node = ugv_control.single_agent_node:main',
+            'swarm_visualizer = ugv_control.swarm_visualizer:main'
         ],
     },
 )
