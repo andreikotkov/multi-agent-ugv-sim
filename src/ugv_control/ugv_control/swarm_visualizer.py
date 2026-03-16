@@ -4,7 +4,6 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Point, Twist
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import matplotlib.colors as mcolors
 import math
 import time
 import os
@@ -17,19 +16,31 @@ class SwarmTrajectoryVisualizer(Node):
         self.robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
         self.d_safe = 0.3 
         
-        
         self.traj_x = {name: [] for name in self.robots}
         self.traj_y = {name: [] for name in self.robots}
         self.current_pos = {name: [0.0, 0.0] for name in self.robots}
         self.current_force = {name: [0.0, 0.0] for name in self.robots}
 
-        # Velocity history for post-simulation plotting
+        # ---------------------------------------------------------
+        # GHOST TRACKING VARIABLES
+        # ---------------------------------------------------------
+        self.ghost_traj_x = []
+        self.ghost_traj_y = []
+        self.vl_start_x = 0.0  
+        self.vl_start_y = 0.0  
+        self.vl_goal_x = 6.0
+        self.vl_goal_y = 6.0
+        self.vl_speed = 0.25 
+        
         self.vel_history_x = {name: [] for name in self.robots}
         self.vel_history_y = {name: [] for name in self.robots}
         self.time_history = {name: [] for name in self.robots}
+        
+        # Sync timer with the controllers
         self.start_time = time.time()
+        self.vl_start_time = self.start_time + 2.0 
 
-        # subscribers
+        # Subscribers
         for name in self.robots:
             self.create_subscription(Odometry, f'/{name}/odom', 
                 lambda msg, n=name: self.odom_callback(msg, n), 10)
@@ -41,8 +52,19 @@ class SwarmTrajectoryVisualizer(Node):
         # Matplotlib Live Setup
         plt.ion()
         self.fig_traj, self.ax_traj = plt.subplots(figsize=(10, 10))
-        self.ax_traj.plot(5.0, 5.0, 'rX', markersize=12, label='Goal')
-        self.ax_traj.set_xlim(-1, 7); self.ax_traj.set_ylim(-1, 7)
+        try:
+            mngr = plt.get_current_fig_manager()
+            mngr.window.wm_geometry("800x600+50+50")
+        except Exception:
+            pass 
+            
+        self.ax_traj.plot(6.0, 6.0, 'rX', markersize=12, label='Goal')
+        
+        # Static Obstacle
+        obs_patch = patches.Rectangle((3.0, 3.0), 1.0, 1.0, color='gray', alpha=0.7, label='Obstacle')
+        self.ax_traj.add_patch(obs_patch)
+
+        self.ax_traj.set_xlim(-1, 8); self.ax_traj.set_ylim(-1, 8)
         self.ax_traj.set_aspect('equal')
         self.ax_traj.grid(True)
         self.ax_traj.set_title("Real-Time Swarm Trajectory & APF Forces")
@@ -51,15 +73,18 @@ class SwarmTrajectoryVisualizer(Node):
         self.lines = {name: self.ax_traj.plot([], [], label=f'{name} Path', animated=True)[0] for name in self.robots}
         self.circles = {}
         self.quivers = {}
+        
+        # --- NEW: Initialize Ghost Graphics ---
+        self.ghost_line, = self.ax_traj.plot([], [], '--', color='gray', alpha=0.5, linewidth=2, label='Virtual Leader', animated=True)
+        self.ghost_marker = patches.Circle((0, 0), 0.15, color='gray', alpha=0.5, animated=True)
+        self.ax_traj.add_patch(self.ghost_marker)
 
         for name in self.robots:
             color = self.lines[name].get_color()
-            # Safety Circle
             circle = patches.Circle((0, 0), self.d_safe/2, color=color, alpha=0.50, animated=True)
             self.ax_traj.add_patch(circle)
             self.circles[name] = circle
             
-            # Force Arrows (Black for visibility) - scale=5.0 for moderate length
             q = self.ax_traj.quiver(0, 0, 0, 0, color='black', scale=20.0, width=0.006, headwidth=4, animated=True)
             self.quivers[name] = q
 
@@ -69,12 +94,10 @@ class SwarmTrajectoryVisualizer(Node):
         self.fig_traj.canvas.draw()
         self.bg = self.fig_traj.canvas.copy_from_bbox(self.ax_traj.bbox)
 
-        # Update timer (0.1s provides the best balance of smoothness and stability)
         self.timer = self.create_timer(0.1, self.update_plot)
 
     def odom_callback(self, msg, name):
         x, y = msg.pose.pose.position.x, msg.pose.pose.position.y
-        # Downsample: Only add point if it moved > 5cm to prevent lag
         if not self.traj_x[name] or math.hypot(x - self.traj_x[name][-1], y - self.traj_y[name][-1]) > 0.05:
             self.traj_x[name].append(x)
             self.traj_y[name].append(y)
@@ -86,56 +109,67 @@ class SwarmTrajectoryVisualizer(Node):
     def vel_callback(self, msg, name):
         curr_t = time.time() - self.start_time
         self.time_history[name].append(curr_t)
-        # We log the force vector components as the intended Cartesian velocities
         fx, fy = self.current_force[name]
         self.vel_history_x[name].append(fx)
         self.vel_history_y[name].append(fy)
 
     def update_plot(self):
         if self.bg is None: return
-        
-        # Restore the clean background
         self.fig_traj.canvas.restore_region(self.bg)
 
+        # ---------------------------------------------------------
+        # UPDATE GHOST POSITION
+        # ---------------------------------------------------------
+        t = time.time() - self.vl_start_time
+        if t < 0: t = 0.0
+        
+        total_dist = math.hypot(self.vl_goal_x - self.vl_start_x, self.vl_goal_y - self.vl_start_y)
+        travel = min(self.vl_speed * t, total_dist)
+        
+        vl_x = self.vl_start_x + (self.vl_goal_x - self.vl_start_x) * (travel / total_dist)
+        vl_y = self.vl_start_y + (self.vl_goal_y - self.vl_start_y) * (travel / total_dist)
+
+        # Record ghost path
+        if not self.ghost_traj_x or math.hypot(vl_x - self.ghost_traj_x[-1], vl_y - self.ghost_traj_y[-1]) > 0.05:
+            self.ghost_traj_x.append(vl_x)
+            self.ghost_traj_y.append(vl_y)
+            
+        # Draw Ghost
+        self.ghost_line.set_data(self.ghost_traj_x, self.ghost_traj_y)
+        self.ghost_marker.center = (vl_x, vl_y)
+        self.ax_traj.draw_artist(self.ghost_line)
+        self.ax_traj.draw_artist(self.ghost_marker)
+
+        # Draw Robots
         for name in self.robots:
             if self.traj_x[name]:
-                # Update trajectory path
                 self.lines[name].set_data(self.traj_x[name], self.traj_y[name])
                 
-                # Update safety circle position
                 cx, cy = self.current_pos[name]
                 self.circles[name].center = (cx, cy)
                 
-                # Update force arrow direction and magnitude
                 fx, fy = self.current_force[name]
                 self.quivers[name].set_offsets([cx, cy])
                 self.quivers[name].set_UVC(fx, fy)
                 
-                # Redraw artists manually for blitting performance
                 self.ax_traj.draw_artist(self.lines[name])
                 self.ax_traj.draw_artist(self.circles[name])
                 self.ax_traj.draw_artist(self.quivers[name])
         
-        # Blit the updated region
         self.fig_traj.canvas.blit(self.ax_traj.bbox)
         self.fig_traj.canvas.flush_events()
 
     def plot_final_results(self):
-        """Saves trajectory and velocity analysis to a new timestamped folder"""
         plt.ioff()
         
-        # Create Folder
         timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         folder_name = f"test_run_{timestamp}"
         os.makedirs(folder_name, exist_ok=True)
-        print(f"\n[Visualizer] Folder created: {folder_name}")
 
-        # 1. Save Final Trajectory Map
         traj_path = os.path.join(folder_name, 'trajectory_map.png')
         self.fig_traj.savefig(traj_path)
         print(f"[Visualizer] Trajectory map saved to {traj_path}")
 
-        # 2. Generate and Save Velocity Analysis Profiles
         fig_vel, axs = plt.subplots(len(self.robots), 1, figsize=(10, 12), sharex=True)
         fig_vel.suptitle(f'Velocity Profiles - {timestamp}', fontsize=16)
 

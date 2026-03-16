@@ -8,18 +8,25 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_ugv_gazebo = get_package_share_directory('ugv_gazebo')
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
+    pkg_ugv_description = get_package_share_directory('ugv_description')
 
+    # 1. PATH TO YOUR CUSTOM WORLD FILE
+    
+    world_path = os.path.join(pkg_ugv_gazebo, 'worlds', 'simulation.world')
+
+    # 2. GAZEBO LAUNCH WITH WORLD ARGUMENT
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_gazebo_ros, 'launch', 'gazebo.launch.py')
-        )
+        ),
+        launch_arguments={'world': world_path}.items() # tells Gazebo to load camera settings
     )
 
+    # 3. ROBOT SPAWNING LOGIC
     spawn_ugv_launch_file = os.path.join(pkg_ugv_gazebo, 'launch', 'spawn_ugv.launch.py')
-
     
     robots = [
-        {'name': 'ugv1', 'x': '0.0', 'y': '0.0'},
+        {'name': 'ugv1', 'x': '-1.0', 'y': '0.0'},
         {'name': 'ugv2', 'x': '0.0', 'y': '1.0'},
         {'name': 'ugv3', 'x': '0.0', 'y': '-1.0'},
         {'name': 'ugv4', 'x': '1.0', 'y': '0.0'},
@@ -30,7 +37,6 @@ def generate_launch_description():
         spawn_actions.append(
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(spawn_ugv_launch_file),
-                
                 launch_arguments=[
                     ('robot_name', robot['name']),
                     ('x_pose', robot['x']),
@@ -41,9 +47,7 @@ def generate_launch_description():
             )
         )
 
-
-# SPAWN THE FLAG 
-    pkg_ugv_description = get_package_share_directory('ugv_description')
+    # 4. SPAWN THE FLAG (GOAL)
     goal_urdf = os.path.join(pkg_ugv_description, 'urdf', 'goal.urdf')
 
     spawn_goal_node = Node(
@@ -53,19 +57,23 @@ def generate_launch_description():
         arguments=[
             '-entity', 'target_goal',
             '-file', goal_urdf,
-            '-x', '5.0',
-            '-y', '5.0',
+            '-x', '6.0',
+            '-y', '6.0',
             '-z', '0.0'
         ],
         output='screen'
     )
-    # ----------------------------------
 
+    # 5. ASSEMBLE LAUNCH DESCRIPTION
     ld = LaunchDescription()
+    
+    # Add Gazebo first
     ld.add_action(gazebo)
+    
+    # Add Goal
     ld.add_action(spawn_goal_node) 
 
-    
+    # Add all Robots
     for action in spawn_actions:
         ld.add_action(action)
 

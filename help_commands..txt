@@ -3,3 +3,5 @@ build: cb
 launch gazebo: ros2 launch ugv_gazebo multi_spawn.launch.py
 
 run control algorithms: ros2 launch ugv_control control.launch.py
+
+use C^ to save plots
