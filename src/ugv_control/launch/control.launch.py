@@ -7,8 +7,8 @@ def generate_launch_description():
     ld = LaunchDescription()
 
     # configuration
-    shared_goal_x = 5.0
-    shared_goal_y = 5.0
+    shared_goal_x = 6.0
+    shared_goal_y = 6.0
     robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
 
     # add 4 individual robot controllers
