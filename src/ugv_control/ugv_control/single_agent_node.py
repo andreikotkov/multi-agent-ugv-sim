@@ -16,21 +16,24 @@ def wrap_angle(angle):
 
 
 def get_yaw_from_quaternion(x, y, z, w):
+    # Correct yaw extraction
     t3 = 2.0 * (w * z + x * y)
     t4 = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(t3, t4)
 
 
-def smoothstep01(u):
-    u = clamp(u, 0.0, 1.0)
-    return u * u * (3.0 - 2.0 * u)
+def mat2_vec2_mul(M, v):
+    return (
+        M[0][0] * v[0] + M[0][1] * v[1],
+        M[1][0] * v[0] + M[1][1] * v[1],
+    )
 
 
 def raised_cosine_bump(x, center, half_width):
     """
-    Smooth bump in [0,1]:
-      1 at x=center
-      0 at |x-center| >= half_width
+    Smooth bump:
+      0 outside [center-half_width, center+half_width]
+      1 at center
     """
     if half_width <= 1e-6:
         return 0.0
@@ -41,14 +44,12 @@ def raised_cosine_bump(x, center, half_width):
 
 
 def closest_point_on_box(px, py, box):
-    # calculating box obstacle dimensions
-    cx = box['cx']
-    cy = box['cy']
-    hx = box['hx']
-    hy = box['hy']
-
-    qx = clamp(px, cx - hx, cx + hx)
-    qy = clamp(py, cy - hy, cy + hy)
+    """
+    Closest point on an axis-aligned box.
+    box = {'cx','cy','hx','hy'}
+    """
+    qx = clamp(px, box['cx'] - box['hx'], box['cx'] + box['hx'])
+    qy = clamp(py, box['cy'] - box['hy'], box['cy'] + box['hy'])
     return qx, qy
 
 
@@ -95,49 +96,37 @@ class SingleAgentController(Node):
 
         self.robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
         if self.robot_name not in self.robots:
-            raise ValueError(f"Unknown robot_name '{self.robot_name}'. Expected one of {self.robots}")
+            raise ValueError(f"Unknown robot_name '{self.robot_name}'")
 
         # ---------------------------------------------------------
-        # Path / leader geometry
+        # Leader path geometry
         # ---------------------------------------------------------
         dx = self.vl_goal_x - self.vl_start_x
         dy = self.vl_goal_y - self.vl_start_y
         self.total_dist = math.hypot(dx, dy)
-
         if self.total_dist < 1e-6:
-            raise ValueError("Virtual leader start and goal are identical.")
+            raise ValueError("Leader start and goal cannot be identical.")
 
-        # Leader-aligned local frame:
-        #   x_local = along the path
-        #   y_local = lateral to the path
+        # Path unit vector only for progress/morph timing
         self.path_ux = dx / self.total_dist
         self.path_uy = dy / self.total_dist
-        self.path_nx = -self.path_uy
-        self.path_ny = self.path_ux
-        self.goal_yaw = math.atan2(dy, dx)
-
-        # Project obstacle center to leader path
-        rel_obs_x = self.obstacle['cx'] - self.vl_start_x
-        rel_obs_y = self.obstacle['cy'] - self.vl_start_y
-        self.obs_path_coord = rel_obs_x * self.path_ux + rel_obs_y * self.path_uy
-        self.obs_path_coord = clamp(self.obs_path_coord, 0.0, self.total_dist)
 
         # ---------------------------------------------------------
-        # Formation definition in leader-local coordinates
+        # WORLD-FRAME RHOMBUS FORMATION
+        # These are offsets from the leader in WORLD frame.
+        # Since leader starts at (0,0), they match your Gazebo spawn.
+        # The formation remains a rhombus in WORLD frame.
         # ---------------------------------------------------------
-        # Cross formation around the ghost leader
-        #   ugv1 = behind
-        #   ugv2 = left/up lateral
-        #   ugv3 = right/down lateral
-        #   ugv4 = ahead
         self.shape_base = {
             'ugv1': (-1.0,  0.0),
             'ugv2': ( 0.0,  1.0),
             'ugv3': ( 0.0, -1.0),
-            'ugv4': ( 0.7,  0.7),
+            'ugv4': ( 1.0,  0.0),
         }
 
-        # Side preference for obstacle bypass bias in the local lateral axis
+        # Morph side assignment near obstacle:
+        # ugv1, ugv2 -> one side
+        # ugv3, ugv4 -> other side
         self.morph_bias_sign = {
             'ugv1':  1.0,
             'ugv2':  1.0,
@@ -148,25 +137,43 @@ class SingleAgentController(Node):
         formation_radius = max(math.hypot(px, py) for px, py in self.shape_base.values())
         obstacle_radius = math.hypot(self.obstacle['hx'], self.obstacle['hy'])
 
-        # Smooth morph region around the obstacle projection on the path
-        self.morph_half_width = obstacle_radius + formation_radius + 0.9
+        # Obstacle path coordinate for morph trigger
+        rel_obs_x = self.obstacle['cx'] - self.vl_start_x
+        rel_obs_y = self.obstacle['cy'] - self.vl_start_y
+        self.obs_path_coord = clamp(
+            rel_obs_x * self.path_ux + rel_obs_y * self.path_uy,
+            0.0,
+            self.total_dist
+        )
 
+
+        # ---------------------------------------------------------
         # Affine morph gains
-        self.lateral_stretch_gain = 1.35
+        # WORLD-FRAME affine transform:
+        #   p_target = p_leader + A(s) p_base + b_i(s)
+        # A(s): stretches and slightly compresses the rhombus near obstacle
+        # b_i(s): side-dependent bias for splitting around obstacle
+        # ---------------------------------------------------------
+        self.lateral_stretch_gain = 1.0
         self.longitudinal_compression_gain = 0.10
-        self.lateral_bias_gain = 0.85
+        self.lateral_bias_gain = 0.65
 
         # ---------------------------------------------------------
-        # Controller gains 
+        # Controller gains / safety
         # ---------------------------------------------------------
-        self.k_att = 2.0
-        self.k_yaw = 2.2
+        self.k_att = 1.4
+        self.k_ff = 0.6
+        self.k_yaw = 1.6
+
+        self.filtered_fx = 0.0
+        self.filtered_fy = 0.0
+        self.force_filter_alpha = 0.25
 
         self.d_safe_robot = 0.65
-        self.k_rep_robot = 0.9
+        self.k_rep_robot = 0.7
 
         self.d_safe_obs = 1.0
-        self.k_rep_obs = 1.8
+        self.k_rep_obs = 1.4
 
         self.max_speed = 0.65
         self.max_turn = 2.5
@@ -212,15 +219,11 @@ class SingleAgentController(Node):
         self.timer = self.create_timer(self.control_period, self.control_loop)
 
         self.get_logger().info(
-            f"{self.robot_name} controller started. "
-            f"Leader path: ({self.vl_start_x:.2f},{self.vl_start_y:.2f}) -> "
-            f"({self.vl_goal_x:.2f},{self.vl_goal_y:.2f}), obstacle box center "
-            f"({self.obstacle['cx']:.2f},{self.obstacle['cy']:.2f}), "
-            f"half-size ({self.obstacle['hx']:.2f},{self.obstacle['hy']:.2f})"
+            f"{self.robot_name} started. World-frame rhombus formation enabled."
         )
 
     # ---------------------------------------------------------
-    # Time helpers
+    # Time
     # ---------------------------------------------------------
     def now_sec(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -247,47 +250,64 @@ class SingleAgentController(Node):
         )
 
     # ---------------------------------------------------------
-    # Geometry / target generation
+    # Leader and formation target generation
     # ---------------------------------------------------------
     def leader_position(self, travel):
         travel = clamp(travel, 0.0, self.total_dist)
-        x = self.vl_start_x + self.path_ux * travel
-        y = self.vl_start_y + self.path_uy * travel
+        ratio = travel / self.total_dist
+        x = self.vl_start_x + (self.vl_goal_x - self.vl_start_x) * ratio
+        y = self.vl_start_y + (self.vl_goal_y - self.vl_start_y) * ratio
         return x, y
 
-    def local_to_world(self, leader_x, leader_y, lx, ly):
-        wx = leader_x + self.path_ux * lx + self.path_nx * ly
-        wy = leader_y + self.path_uy * lx + self.path_ny * ly
-        return wx, wy
+    def morph_gain_for_robot(self, robot_name, travel):
+        leader_x, leader_y = self.leader_position(travel)
+        base_x, base_y = self.shape_base[robot_name]
 
-    def morph_gain(self, travel):
-        return raised_cosine_bump(travel, self.obs_path_coord, self.morph_half_width)
+        # nominal target before morph
+        nominal_x = leader_x + base_x
+        nominal_y = leader_y + base_y
+
+        qx, qy = closest_point_on_box(nominal_x, nominal_y, self.obstacle)
+        d = math.hypot(nominal_x - qx, nominal_y - qy)
+
+        morph_range = 1.6
+        if d >= morph_range:
+            return 0.0
+
+        u = 1.0 - d / morph_range
+        return u * u * (3.0 - 2.0 * u)
 
     def get_target_for_robot(self, robot_name, travel):
         """
-        Affine morph in the leader-local frame:
-            p_local_morph = A(s) * p_local_nominal + b_i(s)
+        WORLD-FRAME formation:
+            p_target = p_leader + A(s) p_base + b_i(s)
 
-        A(s) stretches laterally and slightly compresses longitudinally
-        near the obstacle. b_i(s) gives a robot-dependent lateral bias
-        so the group splits smoothly around the obstacle and reforms later.
+        No rotation by leader yaw. This preserves the rhombus orientation
+        in the world frame, matching your Gazebo spawn layout.
         """
         leader_x, leader_y = self.leader_position(travel)
 
         base_x, base_y = self.shape_base[robot_name]
-        m = self.morph_gain(travel)
+        m = self.morph_gain_for_robot(robot_name, travel)
 
-        # Affine transform A(s)
+        # Affine deformation in WORLD frame
+        # Compress slightly in x, stretch in y
         ax = 1.0 - self.longitudinal_compression_gain * m
         ay = 1.0 + self.lateral_stretch_gain * m
 
-        # Bias b_i(s)
+        # Side bias in WORLD y direction
         bias_y = self.lateral_bias_gain * self.morph_bias_sign[robot_name] * m
 
-        lx = ax * base_x
-        ly = ay * base_y + bias_y
+        A = (
+            (ax, 0.0),
+            (0.0, ay),
+        )
+        b = (0.0, bias_y)
 
-        tx, ty = self.local_to_world(leader_x, leader_y, lx, ly)
+        aff_x, aff_y = mat2_vec2_mul(A, (base_x, base_y))
+
+        tx = leader_x + aff_x + b[0]
+        ty = leader_y + aff_y + b[1]
         return tx, ty
 
     def all_robots_settled(self):
@@ -304,10 +324,11 @@ class SingleAgentController(Node):
 
             if math.hypot(tx - rx, ty - ry) > self.all_settled_tol:
                 return False
+
         return True
 
     # ---------------------------------------------------------
-    # Main loop
+    # Main control loop
     # ---------------------------------------------------------
     def control_loop(self):
         if not self.have_self_odom or self.motion_start_time is None:
@@ -319,14 +340,12 @@ class SingleAgentController(Node):
         if self.last_control_time is None:
             dt = self.control_period
         else:
-            dt = now - self.last_control_time
-            dt = clamp(dt, 1e-3, 0.25)
+            dt = clamp(now - self.last_control_time, 1e-3, 0.25)
 
         self.last_control_time = now
-
         t = now - self.motion_start_time
 
-        # Warm-up phase
+        # Warm-up
         if t < 0.0:
             self.stop_robot()
             return
@@ -342,12 +361,11 @@ class SingleAgentController(Node):
         ff_vx = (next_target_x - my_target_x) / dt
         ff_vy = (next_target_y - my_target_y) / dt
 
-        # Attractive tracking term + feedforward slot velocity
         ex = my_target_x - self.current_x
         ey = my_target_y - self.current_y
 
-        f_att_x = self.k_att * ex + ff_vx
-        f_att_y = self.k_att * ey + ff_vy
+        f_att_x = self.k_att * ex + self.k_ff * ff_vx
+        f_att_y = self.k_att * ey + self.k_ff * ff_vy
 
         dist_to_my_target = math.hypot(ex, ey)
         is_leader_at_goal = (current_travel >= self.total_dist - 1e-6)
@@ -374,7 +392,7 @@ class SingleAgentController(Node):
                 f_rep_y += rep_mag * dy / safe_dist
 
         # ---------------------------------------------------------
-        # Box obstacle repulsion (safety layer)
+        # Box obstacle repulsion
         # ---------------------------------------------------------
         qx, qy = closest_point_on_box(self.current_x, self.current_y, self.obstacle)
         dxo = self.current_x - qx
@@ -385,16 +403,18 @@ class SingleAgentController(Node):
         f_obs_y = 0.0
 
         if dist_obs < self.d_safe_obs:
-            # If exactly inside/on the box, push away from box center
             if dist_obs < 1e-6:
+                # Inside or exactly on boundary: push using center-based fallback
                 dxo = self.current_x - self.obstacle['cx']
                 dyo = self.current_y - self.obstacle['cy']
                 norm = math.hypot(dxo, dyo)
+
                 if norm < 1e-6:
-                    # fallback direction: push along lateral side preference
-                    dxo = self.path_nx * self.morph_bias_sign[self.robot_name]
-                    dyo = self.path_ny * self.morph_bias_sign[self.robot_name]
-                    norm = math.hypot(dxo, dyo)
+                    # fallback: push in world y based on side assignment
+                    dxo = 0.0
+                    dyo = self.morph_bias_sign[self.robot_name]
+                    norm = 1.0
+
                 dxo /= norm
                 dyo /= norm
                 safe_dist = 0.08
@@ -408,12 +428,27 @@ class SingleAgentController(Node):
             f_obs_y = rep_mag * dyo
 
         # ---------------------------------------------------------
-        # Total guidance force
+        # Total force
         # ---------------------------------------------------------
         total_fx = f_att_x + f_rep_x + f_obs_x
         total_fy = f_att_y + f_rep_y + f_obs_y
 
-        force_norm = math.hypot(total_fx, total_fy)
+        # Low-pass filter
+        self.filtered_fx = (
+            (1.0 - self.force_filter_alpha) * self.filtered_fx
+            + self.force_filter_alpha * total_fx
+        )
+
+        self.filtered_fy = (
+            (1.0 - self.force_filter_alpha) * self.filtered_fy
+            + self.force_filter_alpha * total_fy
+        )
+
+        force_x = self.filtered_fx
+        force_y = self.filtered_fy
+
+        force_norm = math.hypot(force_x, force_y)
+
 
         force_msg = Point()
         force_msg.x = float(total_fx)
@@ -422,14 +457,13 @@ class SingleAgentController(Node):
         self.force_pub.publish(force_msg)
 
         # ---------------------------------------------------------
-        # Goal settling logic
+        # Final settling
         # ---------------------------------------------------------
         if is_leader_at_goal:
             if self.all_robots_settled() and dist_to_my_target < self.final_tol:
                 self.stop_robot()
                 return
 
-        # Near the end, slow down for clean parking
         if is_leader_at_goal and dist_to_my_target < 0.8:
             current_max_speed = self.final_max_speed
             current_max_turn = self.final_max_turn
@@ -438,7 +472,7 @@ class SingleAgentController(Node):
             current_max_turn = self.max_turn
 
         # ---------------------------------------------------------
-        # Kinematic mapping
+        # Kinematic command
         # ---------------------------------------------------------
         cmd = Twist()
 
@@ -446,15 +480,16 @@ class SingleAgentController(Node):
             self.cmd_pub.publish(cmd)
             return
 
-        target_yaw = math.atan2(total_fy, total_fx)
+        target_yaw = math.atan2(force_y, force_x)
         yaw_error = wrap_angle(target_yaw - self.current_yaw)
 
-        # Forward-only differential drive style:
-        # move only if target is roughly in front
+        if abs(yaw_error) < 0.03:
+            speed_cmd = 0.0
+
         heading_factor = max(0.0, math.cos(yaw_error))
         speed_cmd = min(current_max_speed, force_norm) * heading_factor
 
-        if abs(yaw_error) > math.pi / 2.0:
+        if abs(yaw_error) < 0.03:
             speed_cmd = 0.0
 
         cmd.linear.x = speed_cmd
