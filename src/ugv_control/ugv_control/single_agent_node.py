@@ -451,8 +451,8 @@ class SingleAgentController(Node):
 
 
         force_msg = Point()
-        force_msg.x = float(total_fx)
-        force_msg.y = float(total_fy)
+        force_msg.x = float(force_x)
+        force_msg.y = float(force_y)
         force_msg.z = 0.0
         self.force_pub.publish(force_msg)
 
@@ -483,18 +483,16 @@ class SingleAgentController(Node):
         target_yaw = math.atan2(force_y, force_x)
         yaw_error = wrap_angle(target_yaw - self.current_yaw)
 
-        if abs(yaw_error) < 0.03:
-            speed_cmd = 0.0
+        cmd.angular.z = clamp(self.k_yaw * yaw_error, -current_max_turn, current_max_turn)
 
         heading_factor = max(0.0, math.cos(yaw_error))
         speed_cmd = min(current_max_speed, force_norm) * heading_factor
 
-        if abs(yaw_error) < 0.03:
+        # Rotate in place only if badly misaligned
+        if abs(yaw_error) > 0.4:
             speed_cmd = 0.0
 
         cmd.linear.x = speed_cmd
-        cmd.angular.z = clamp(self.k_yaw * yaw_error, -current_max_turn, current_max_turn)
-
         self.cmd_pub.publish(cmd)
 
     def stop_robot(self):
