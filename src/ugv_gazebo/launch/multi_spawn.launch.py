@@ -57,8 +57,8 @@ def generate_launch_description():
         arguments=[
             '-entity', 'target_goal',
             '-file', goal_urdf,
-            '-x', '6.0',
-            '-y', '6.0',
+            '-x', '10.0',
+            '-y', '10.0',
             '-z', '0.0'
         ],
         output='screen'

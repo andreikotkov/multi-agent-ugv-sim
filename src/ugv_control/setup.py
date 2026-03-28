@@ -25,7 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'single_agent_node = ugv_control.single_agent_node:main',
-            'swarm_visualizer = ugv_control.swarm_visualizer:main'
+            'swarm_visualizer = ugv_control.swarm_visualizer:main',
+            'global_obstacle_publisher = ugv_control.global_obstacle_publisher:main',
         ],
     },
 )
