@@ -27,6 +27,8 @@ setup(
             'single_agent_node = ugv_control.single_agent_node:main',
             'swarm_visualizer = ugv_control.swarm_visualizer:main',
             'global_obstacle_publisher = ugv_control.global_obstacle_publisher:main',
+            'delayed_gazebo_obstacle_spawner = ugv_control.delayed_gazebo_obstacle_spawner:main',
+            'formation_mode_manager = ugv_control.formation_mode_manager:main',
         ],
     },
 )

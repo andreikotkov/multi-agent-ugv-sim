@@ -1,6 +1,5 @@
 import math
 import os
-import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -27,11 +26,9 @@ class SwarmTrajectoryVisualizer(Node):
         self.robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
         self.d_safe = 0.3
 
-        self.declare_parameter('mode_source_robot', 'ugv1')
         self.declare_parameter('obstacle_timeout', 1.0)
         self.declare_parameter('mode_timeout', 1.0)
 
-        self.mode_source_robot = str(self.get_parameter('mode_source_robot').value)
         self.obstacle_timeout = float(self.get_parameter('obstacle_timeout').value)
         self.mode_timeout = float(self.get_parameter('mode_timeout').value)
 
@@ -46,7 +43,7 @@ class SwarmTrajectoryVisualizer(Node):
         self.vl_goal_x = 10.0
         self.vl_goal_y = 10.0
         self.vl_speed = 0.25
-        self.warmup_duration = 2.0
+        self.warmup_duration = 0.0
 
         self.ghost_traj_x = []
         self.ghost_traj_y = []
@@ -77,8 +74,10 @@ class SwarmTrajectoryVisualizer(Node):
         if self.total_dist < 1e-9:
             raise ValueError("Leader start and goal cannot be identical.")
 
-        self.start_time = time.time()
-        self.vl_start_time = self.start_time + self.warmup_duration
+        # synchronized start with all robots
+        self.start_time = None
+        self.vl_start_time = None
+        self.have_odom = {name: False for name in self.robots}
 
         for name in self.robots:
             self.create_subscription(
@@ -109,21 +108,21 @@ class SwarmTrajectoryVisualizer(Node):
 
         self.create_subscription(
             String,
-            f'/{self.mode_source_robot}/formation_mode',
+            '/formation_mode_global',
             self.mode_callback,
             10
         )
 
         self.create_subscription(
             Float32,
-            f'/{self.mode_source_robot}/formation_mode_gain',
+            '/formation_mode_gain_global',
             self.mode_gain_callback,
             10
         )
 
         self.create_subscription(
             Marker,
-            f'/{self.mode_source_robot}/active_obstacle_marker',
+            '/active_obstacle_global',
             self.active_obstacle_callback,
             10
         )
@@ -154,8 +153,10 @@ class SwarmTrajectoryVisualizer(Node):
         self.quivers = {}
 
         self.setup_plot()
-
         self.timer = self.create_timer(0.01, self.update_plot)
+
+    def now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     # ---------------------------------------------------------
     # Plot setup
@@ -222,7 +223,7 @@ class SwarmTrajectoryVisualizer(Node):
         )
 
         self.event_text = self.ax_traj.text(
-            0.60, 0.06, "",
+            0.50, 0.06, "",
             transform=self.ax_traj.transAxes,
             ha='left', va='bottom',
             fontsize=9,
@@ -239,7 +240,10 @@ class SwarmTrajectoryVisualizer(Node):
     # Helpers
     # ---------------------------------------------------------
     def add_event(self, text):
-        stamp = time.time() - self.start_time
+        if self.start_time is None:
+            stamp = 0.0
+        else:
+            stamp = self.now_sec() - self.start_time
         self.event_log.append(f"[{stamp:6.2f}s] {text}")
         if len(self.event_log) > self.max_event_lines:
             self.event_log = self.event_log[-self.max_event_lines:]
@@ -286,11 +290,11 @@ class SwarmTrajectoryVisualizer(Node):
             if active is None:
                 self.add_event("Active obstacle cleared")
             else:
-               self.add_event("Active obstacle:")
-               self.add_event(
+                self.add_event("Active obstacle:")
+                self.add_event(
                     f"x={active['cx']:.2f},y={active['cy']:.2f}, "
                     f"hx={active['hx']:.2f},hy={active['hy']:.2f}"
-)
+                )
             self.last_logged_active_obstacle = None if active is None else dict(active)
 
     def clear_obstacle_artists(self):
@@ -370,6 +374,17 @@ class SwarmTrajectoryVisualizer(Node):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
 
+        if not self.have_odom[name]:
+            self.have_odom[name] = True
+            self.get_logger().info(f"Received first odometry from {name}")
+
+        if self.start_time is None and all(self.have_odom.values()):
+            self.start_time = self.now_sec()
+            self.vl_start_time = self.start_time + self.warmup_duration
+            self.get_logger().info(
+                f"All robot odometry received. Visualizer virtual leader will start after {self.warmup_duration:.2f}s warmup."
+            )
+
         if not self.traj_x[name] or math.hypot(x - self.traj_x[name][-1], y - self.traj_y[name][-1]) > self.traj_append_dist:
             self.traj_x[name].append(x)
             self.traj_y[name].append(y)
@@ -380,7 +395,10 @@ class SwarmTrajectoryVisualizer(Node):
         self.current_force[name] = [msg.x, msg.y]
 
     def vel_callback(self, msg, name):
-        curr_t = time.time() - self.start_time
+        if self.start_time is None:
+            curr_t = 0.0
+        else:
+            curr_t = self.now_sec() - self.start_time
         self.time_history[name].append(curr_t)
         self.cmd_linear_history[name].append(msg.linear.x)
         self.cmd_angular_history[name].append(msg.angular.z)
@@ -402,18 +420,18 @@ class SwarmTrajectoryVisualizer(Node):
             })
 
         self.detected_obstacles = obstacles
-        self.last_obstacle_update_time = time.time()
+        self.last_obstacle_update_time = self.now_sec()
 
     def mode_callback(self, msg):
         self.current_mode = msg.data
-        self.last_mode_update_time = time.time()
+        self.last_mode_update_time = self.now_sec()
 
     def mode_gain_callback(self, msg):
         self.current_mode_gain = float(msg.data)
-        self.last_mode_update_time = time.time()
+        self.last_mode_update_time = self.now_sec()
 
     def active_obstacle_callback(self, msg):
-        self.last_active_obstacle_time = time.time()
+        self.last_active_obstacle_time = self.now_sec()
 
         if msg.action in (Marker.DELETE, Marker.DELETEALL):
             self.active_obstacle = None
@@ -433,18 +451,22 @@ class SwarmTrajectoryVisualizer(Node):
     # Plot update
     # ---------------------------------------------------------
     def update_plot(self):
-        t = time.time() - self.vl_start_time
-        if t < 0.0:
+        if self.vl_start_time is None:
             t = 0.0
+            travel = 0.0
+        else:
+            t = self.now_sec() - self.vl_start_time
+            if t < 0.0:
+                t = 0.0
+            travel = min(self.vl_speed * t, self.total_dist)
 
-        travel = min(self.vl_speed * t, self.total_dist)
         vl_x, vl_y = self.leader_position(travel)
 
         if not self.ghost_traj_x or math.hypot(vl_x - self.ghost_traj_x[-1], vl_y - self.ghost_traj_y[-1]) > self.traj_append_dist:
             self.ghost_traj_x.append(vl_x)
             self.ghost_traj_y.append(vl_y)
 
-        now = time.time()
+        now = self.now_sec()
 
         obstacles_are_fresh = (
             self.last_obstacle_update_time is not None and
@@ -485,11 +507,18 @@ class SwarmTrajectoryVisualizer(Node):
             self.rebuild_obstacle_artists(shown_active, obstacles_are_fresh)
 
         status_lines = [
-            f"Mode source: {self.mode_source_robot}",
+            "Mode source: global",
             f"Mode: {shown_mode}",
             f"Mode gain: {shown_gain:.2f}",
             f"Detected obstacles: {len(self.detected_obstacles) if obstacles_are_fresh else 0}",
         ]
+
+        if self.vl_start_time is None:
+            status_lines.append("Virtual leader: waiting for odom")
+        else:
+            wait_left = self.vl_start_time - now
+            if wait_left > 0.0:
+                status_lines.append(f"Virtual leader start in: {wait_left:.2f}s")
 
         if obstacles_are_fresh and self.detected_obstacles:
             obstacle_lines = ["Detected obstacle boxes:"]

@@ -10,6 +10,7 @@ class GlobalObstaclePublisher(Node):
         self.declare_parameter('frame_id', 'map')
         self.declare_parameter('publish_period', 0.2)
 
+        # Static obstacles from parameters
         # Each obstacle is defined by center (cx, cy) and half-sizes (hx, hy)
         self.declare_parameter('obstacle_cxs', [3.5])
         self.declare_parameter('obstacle_cys', [3.5])
@@ -22,6 +23,18 @@ class GlobalObstaclePublisher(Node):
         self.pub = self.create_publisher(MarkerArray, '/detected_obstacles', 10)
         self.timer = self.create_timer(self.publish_period, self.publish_obstacles)
 
+        # Store node start time
+        self.start_time = self.get_clock().now()
+
+        # Delayed obstacle settings
+        self.delayed_spawn_time = 30.0  # seconds
+        self.delayed_cx = 6.0
+        self.delayed_cy = 8.5
+        self.delayed_hx = 1.5   # 3 / 2
+        self.delayed_hy = 0.5   # 1 / 2
+
+        self.delayed_obstacle_announced = False
+
         self.get_logger().info("Global obstacle publisher started on /detected_obstacles")
 
     def get_obstacle_arrays(self):
@@ -29,6 +42,25 @@ class GlobalObstaclePublisher(Node):
         cys = list(self.get_parameter('obstacle_cys').value)
         hxs = list(self.get_parameter('obstacle_hxs').value)
         hys = list(self.get_parameter('obstacle_hys').value)
+
+        # Time since node start
+        elapsed = (self.get_clock().now() - self.start_time).nanoseconds * 1e-9
+
+        # Add delayed obstacle after 30 seconds
+        if elapsed >= self.delayed_spawn_time:
+            cxs.append(self.delayed_cx)
+            cys.append(self.delayed_cy)
+            hxs.append(self.delayed_hx)
+            hys.append(self.delayed_hy)
+
+            if not self.delayed_obstacle_announced:
+                self.delayed_obstacle_announced = True
+                self.get_logger().info(
+                    f"Delayed obstacle spawned at t={elapsed:.1f}s: "
+                    f"cx={self.delayed_cx}, cy={self.delayed_cy}, "
+                    f"hx={self.delayed_hx}, hy={self.delayed_hy}"
+                )
+
         return cxs, cys, hxs, hys
 
     def publish_obstacles(self):
