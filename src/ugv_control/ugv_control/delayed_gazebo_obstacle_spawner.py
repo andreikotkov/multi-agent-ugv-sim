@@ -1,5 +1,8 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.clock import Clock, ClockType
+from rclpy.parameter import Parameter
+
 from geometry_msgs.msg import Pose
 from gazebo_msgs.srv import SpawnEntity
 
@@ -8,12 +11,52 @@ class DelayedGazeboObstacleSpawner(Node):
     def __init__(self):
         super().__init__('delayed_gazebo_obstacle_spawner')
 
+        self.spawn_delay_sec = self.reqf('spawn_delay_sec')
+        self.obstacle_name = self.reqs('obstacle_name')
+
+        self.obstacle_size_x = self.reqf('obstacle_size_x')
+        self.obstacle_size_y = self.reqf('obstacle_size_y')
+        self.obstacle_size_z = self.reqf('obstacle_size_z')
+
+        self.obstacle_pos_x = self.reqf('obstacle_pos_x')
+        self.obstacle_pos_y = self.reqf('obstacle_pos_y')
+        self.obstacle_pos_z = self.reqf('obstacle_pos_z')
+
         self.client = self.create_client(SpawnEntity, '/spawn_entity')
         while not self.client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for /spawn_entity service...')
 
         self.spawned = False
-        self.timer = self.create_timer(30.0, self.spawn_obstacle_once)
+
+        self.wall_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
+        self.timer = self.create_timer(
+            self.spawn_delay_sec,
+            self.spawn_obstacle_once,
+            clock=self.wall_clock
+        )
+
+        self.get_logger().info(
+            f"Obstacle '{self.obstacle_name}' will spawn "
+            f"{self.spawn_delay_sec:.1f} real seconds after script launch."
+        )
+
+    def require_param(self, name):
+        self.declare_parameter(name)
+        param = self.get_parameter(name)
+
+        if param.type_ == Parameter.Type.NOT_SET:
+            raise RuntimeError(
+                f"Required parameter '{name}' is missing for node "
+                f"'{self.get_name()}'. Provide it in the YAML config or launch file."
+            )
+
+        return param.value
+
+    def reqf(self, name):
+        return float(self.require_param(name))
+
+    def reqs(self, name):
+        return str(self.require_param(name))
 
     def spawn_obstacle_once(self):
         if self.spawned:
@@ -22,22 +65,22 @@ class DelayedGazeboObstacleSpawner(Node):
         self.spawned = True
         self.timer.cancel()
 
-        sdf = """
+        sdf = f"""
         <sdf version="1.7">
-          <model name="delayed_rect_obstacle">
+          <model name="{self.obstacle_name}">
             <static>true</static>
             <link name="link">
               <collision name="collision">
                 <geometry>
                   <box>
-                    <size>3.0 1.0 0.5</size>
+                    <size>{self.obstacle_size_x} {self.obstacle_size_y} {self.obstacle_size_z}</size>
                   </box>
                 </geometry>
               </collision>
               <visual name="visual">
                 <geometry>
                   <box>
-                    <size>3.0 1.0 0.5</size>
+                    <size>{self.obstacle_size_x} {self.obstacle_size_y} {self.obstacle_size_z}</size>
                   </box>
                 </geometry>
                 <material>
@@ -51,15 +94,15 @@ class DelayedGazeboObstacleSpawner(Node):
         """
 
         req = SpawnEntity.Request()
-        req.name = 'delayed_rect_obstacle'
+        req.name = self.obstacle_name
         req.xml = sdf
         req.robot_namespace = ''
         req.reference_frame = 'world'
 
         req.initial_pose = Pose()
-        req.initial_pose.position.x = 6.0
-        req.initial_pose.position.y = 8.5
-        req.initial_pose.position.z = 0.1
+        req.initial_pose.position.x = self.obstacle_pos_x
+        req.initial_pose.position.y = self.obstacle_pos_y
+        req.initial_pose.position.z = self.obstacle_pos_z
         req.initial_pose.orientation.w = 1.0
 
         future = self.client.call_async(req)

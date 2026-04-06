@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.clock import Clock, ClockType
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -23,15 +24,26 @@ class GlobalObstaclePublisher(Node):
         self.pub = self.create_publisher(MarkerArray, '/detected_obstacles', 10)
         self.timer = self.create_timer(self.publish_period, self.publish_obstacles)
 
-        # Store node start time
-        self.start_time = self.get_clock().now()
+        # Store node start time using real wall clock
+        self.wall_clock = Clock(clock_type=ClockType.SYSTEM_TIME)
+        self.start_time = self.wall_clock.now()
 
-        # Delayed obstacle settings
-        self.delayed_spawn_time = 30.0  # seconds
-        self.delayed_cx = 6.0
-        self.delayed_cy = 8.5
-        self.delayed_hx = 1.5   # 3 / 2
-        self.delayed_hy = 0.5   # 1 / 2
+        # Delayed obstacle settings from YAML / launch
+        self.declare_parameter('spawn_delay_sec', 30.0)
+        self.declare_parameter('obstacle_name', 'delayed_rect_obstacle')
+        self.declare_parameter('obstacle_size_x', 3.0)
+        self.declare_parameter('obstacle_size_y', 1.0)
+        self.declare_parameter('obstacle_size_z', 1.0)
+        self.declare_parameter('obstacle_pos_x', 6.0)
+        self.declare_parameter('obstacle_pos_y', 8.5)
+        self.declare_parameter('obstacle_pos_z', 0.1)
+
+        self.delayed_spawn_time = float(self.get_parameter('spawn_delay_sec').value)
+        self.delayed_name = str(self.get_parameter('obstacle_name').value)
+        self.delayed_cx = float(self.get_parameter('obstacle_pos_x').value)
+        self.delayed_cy = float(self.get_parameter('obstacle_pos_y').value)
+        self.delayed_hx = 0.5 * float(self.get_parameter('obstacle_size_x').value)
+        self.delayed_hy = 0.5 * float(self.get_parameter('obstacle_size_y').value)
 
         self.delayed_obstacle_announced = False
 
@@ -43,10 +55,10 @@ class GlobalObstaclePublisher(Node):
         hxs = list(self.get_parameter('obstacle_hxs').value)
         hys = list(self.get_parameter('obstacle_hys').value)
 
-        # Time since node start
-        elapsed = (self.get_clock().now() - self.start_time).nanoseconds * 1e-9
+        # Real time since node start
+        elapsed = (self.wall_clock.now() - self.start_time).nanoseconds * 1e-9
 
-        # Add delayed obstacle after 30 seconds
+        # Add delayed obstacle after configured real-time delay
         if elapsed >= self.delayed_spawn_time:
             cxs.append(self.delayed_cx)
             cys.append(self.delayed_cy)
@@ -56,7 +68,8 @@ class GlobalObstaclePublisher(Node):
             if not self.delayed_obstacle_announced:
                 self.delayed_obstacle_announced = True
                 self.get_logger().info(
-                    f"Delayed obstacle spawned at t={elapsed:.1f}s: "
+                    f"Delayed obstacle published at t={elapsed:.1f}s: "
+                    f"name={self.delayed_name}, "
                     f"cx={self.delayed_cx}, cy={self.delayed_cy}, "
                     f"hx={self.delayed_hx}, hy={self.delayed_hy}"
                 )

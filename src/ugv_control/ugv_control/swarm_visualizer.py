@@ -1,17 +1,12 @@
 import math
-import os
-from datetime import datetime
-
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.ticker import MultipleLocator
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import Point, Twist
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -19,38 +14,63 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-class SwarmTrajectoryVisualizer(Node):
+class SwarmRvizVisualizer(Node):
     def __init__(self):
-        super().__init__('swarm_visualizer')
+        super().__init__('swarm_rviz_visualizer')
 
         self.robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
+        self.frame_id = 'map'
+
         self.d_safe = 0.3
+        self.traj_append_dist = 0.02
+        self.force_scale = 0.8
 
-        self.declare_parameter('obstacle_timeout', 1.0)
-        self.declare_parameter('mode_timeout', 1.0)
+        # ---------------------------------------------------------
+        # Parameters (mandatory from YAML / launch)
+        # ---------------------------------------------------------
+        self.obstacle_timeout = self.reqf('obstacle_timeout')
+        self.mode_timeout = self.reqf('mode_timeout')
 
-        self.obstacle_timeout = float(self.get_parameter('obstacle_timeout').value)
-        self.mode_timeout = float(self.get_parameter('mode_timeout').value)
+        self.vl_start_x = self.reqf('vl_start_x')
+        self.vl_start_y = self.reqf('vl_start_y')
+        self.vl_goal_x = self.reqf('vl_goal_x')
+        self.vl_goal_y = self.reqf('vl_goal_y')
+        self.vl_speed = self.reqf('vl_speed')
+        self.warmup_duration = self.reqf('warmup_duration')
 
-        self.traj_x = {name: [] for name in self.robots}
-        self.traj_y = {name: [] for name in self.robots}
+        # Optional tuning params for RViz rendering
+        self.robot_height = self.get_param_float('robot_height', 0.12)
+        self.robot_label_z = self.get_param_float('robot_label_z', 0.35)
+        self.force_z = self.get_param_float('force_z', 0.06)
+        self.trail_width = self.get_param_float('trail_width', 0.04)
+        self.ghost_trail_width = self.get_param_float('ghost_trail_width', 0.06)
+        self.reference_path_width = self.get_param_float('reference_path_width', 0.05)
+        self.obstacle_height = self.get_param_float('obstacle_height', 0.20)
+
+        self.status_text_x = self.get_param_float('status_text_x', 11.0)
+        self.status_text_y = self.get_param_float('status_text_y', 2.0)
+        self.status_text_z = self.get_param_float('status_text_z', 1.0)
+        self.status_line_spacing = self.get_param_float('status_line_spacing', 0.38)
+        self.status_text_size = self.get_param_float('status_text_size', 0.30)
+
+        # ---------------------------------------------------------
+        # Leader path geometry
+        # ---------------------------------------------------------
+        dx = self.vl_goal_x - self.vl_start_x
+        dy = self.vl_goal_y - self.vl_start_y
+        self.total_dist = math.hypot(dx, dy)
+        if self.total_dist < 1e-9:
+            raise ValueError("Leader start and goal cannot be identical.")
+
+        # ---------------------------------------------------------
+        # State
+        # ---------------------------------------------------------
         self.current_pos = {name: [0.0, 0.0] for name in self.robots}
         self.current_force = {name: [0.0, 0.0] for name in self.robots}
-        self.traj_append_dist = 0.02
+        self.have_odom = {name: False for name in self.robots}
 
-        self.vl_start_x = 0.0
-        self.vl_start_y = 0.0
-        self.vl_goal_x = 10.0
-        self.vl_goal_y = 10.0
-        self.vl_speed = 0.25
-        self.warmup_duration = 0.0
-
-        self.ghost_traj_x = []
-        self.ghost_traj_y = []
-
-        self.cmd_linear_history = {name: [] for name in self.robots}
-        self.cmd_angular_history = {name: [] for name in self.robots}
-        self.time_history = {name: [] for name in self.robots}
+        self.trails = {name: [] for name in self.robots}
+        self.ghost_trail = []
 
         self.detected_obstacles = []
         self.last_obstacle_update_time = None
@@ -62,23 +82,24 @@ class SwarmTrajectoryVisualizer(Node):
         self.active_obstacle = None
         self.last_active_obstacle_time = None
 
-        self.event_log = []
-        self.max_event_lines = 12
-        self.last_logged_mode = None
-        self.last_logged_active_obstacle = None
-        self.last_logged_obstacle_count = None
-
-        dx = self.vl_goal_x - self.vl_start_x
-        dy = self.vl_goal_y - self.vl_start_y
-        self.total_dist = math.hypot(dx, dy)
-        if self.total_dist < 1e-9:
-            raise ValueError("Leader start and goal cannot be identical.")
-
-        # synchronized start with all robots
         self.start_time = None
         self.vl_start_time = None
-        self.have_odom = {name: False for name in self.robots}
+        self.have_global_start_time = False
 
+        # These histories are kept only because your old node subscribed to them.
+        # Not visualized here, but harmless to retain.
+        self.cmd_linear_history = {name: [] for name in self.robots}
+        self.cmd_angular_history = {name: [] for name in self.robots}
+        self.time_history = {name: [] for name in self.robots}
+
+        # ---------------------------------------------------------
+        # Publishers
+        # ---------------------------------------------------------
+        self.marker_pub = self.create_publisher(MarkerArray, '/swarm_rviz_markers', 10)
+
+        # ---------------------------------------------------------
+        # Subscriptions
+        # ---------------------------------------------------------
         for name in self.robots:
             self.create_subscription(
                 Odometry,
@@ -127,126 +148,55 @@ class SwarmTrajectoryVisualizer(Node):
             10
         )
 
-        plt.ion()
-        self.fig_traj, self.ax_traj = plt.subplots(figsize=(16, 12))
-        try:
-            mngr = plt.get_current_fig_manager()
-            mngr.window.wm_geometry("800x600+30+30")
-        except Exception:
-            pass
+        self.create_subscription(
+            Float64,
+            '/swarm_motion_start_time',
+            self.global_motion_start_time_callback,
+            10
+        )
 
-        self.robot_colors = {}
-        self.lines = {}
-        self.circles = {}
-        self.robot_labels = {}
+        # Publish loop
+        self.timer = self.create_timer(0.05, self.publish_markers)
 
-        self.ghost_line = None
-        self.ghost_marker = None
+        self.get_logger().info('swarm_rviz_visualizer started.')
 
-        self.status_text = None
-        self.obstacle_list_text = None
-        self.event_text = None
+    # ---------------------------------------------------------
+    # Mandatory parameter helpers
+    # ---------------------------------------------------------
+    def require_param(self, name):
+        self.declare_parameter(name)
+        param = self.get_parameter(name)
 
-        self.obstacle_rects = []
-        self.obstacle_texts = []
-        self.active_obstacle_rect = None
-        self.quivers = {}
+        if param.type_ == Parameter.Type.NOT_SET:
+            raise RuntimeError(
+                f"Required parameter '{name}' is missing for node "
+                f"'{self.get_name()}'. Provide it in the YAML config or launch file."
+            )
 
-        self.setup_plot()
-        self.timer = self.create_timer(0.01, self.update_plot)
+        return param.value
 
+    def reqf(self, name):
+        return float(self.require_param(name))
+
+    def get_param_float(self, name, default_value):
+        self.declare_parameter(name, default_value)
+        return float(self.get_parameter(name).value)
+
+    # ---------------------------------------------------------
+    # Time
+    # ---------------------------------------------------------
     def now_sec(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
     # ---------------------------------------------------------
-    # Plot setup
-    # ---------------------------------------------------------
-    def setup_plot(self):
-        self.ax_traj.set_xlim(-4, 16)
-        self.ax_traj.set_ylim(-1, 12)
-        self.ax_traj.set_aspect('equal')
-
-        self.ax_traj.xaxis.set_major_locator(MultipleLocator(1.0))
-        self.ax_traj.yaxis.set_major_locator(MultipleLocator(1.0))
-        self.ax_traj.grid(True, which='major', linewidth=0.8)
-
-        self.ax_traj.set_title("Real-Time Swarm Trajectory, Forces, Obstacles, and Exact Controller Mode")
-
-        self.ax_traj.plot(
-            self.vl_goal_x, self.vl_goal_y,
-            'rX', markersize=12, label='Goal'
-        )
-
-        self.ax_traj.plot(
-            [self.vl_start_x, self.vl_goal_x],
-            [self.vl_start_y, self.vl_goal_y],
-            ':', color='gray', alpha=0.6, label='Leader path'
-        )
-
-        self.ghost_line, = self.ax_traj.plot(
-            [], [], '--', color='gray', alpha=0.7, linewidth=2, label='Virtual Leader'
-        )
-        self.ghost_marker = patches.Circle((0.0, 0.0), 0.12, color='gray', alpha=0.7)
-        self.ax_traj.add_patch(self.ghost_marker)
-
-        for name in self.robots:
-            line, = self.ax_traj.plot([], [], linewidth=1.6, label=f'{name} Path')
-            self.lines[name] = line
-            self.robot_colors[name] = line.get_color()
-
-        for name in self.robots:
-            circle = patches.Circle(
-                (0.0, 0.0), self.d_safe / 2.0,
-                color=self.robot_colors[name], alpha=0.45
-            )
-            self.ax_traj.add_patch(circle)
-            self.circles[name] = circle
-
-            self.robot_labels[name] = self.ax_traj.text(0.0, 0.0, name, fontsize=9)
-            self.quivers[name] = None
-
-        self.status_text = self.ax_traj.text(
-            0.02, 0.98, "",
-            transform=self.ax_traj.transAxes,
-            ha='left', va='top',
-            fontsize=10,
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.88)
-        )
-
-        self.obstacle_list_text = self.ax_traj.text(
-            0.02, 0.62, "",
-            transform=self.ax_traj.transAxes,
-            ha='left', va='top',
-            fontsize=9,
-            family='monospace',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.88)
-        )
-
-        self.event_text = self.ax_traj.text(
-            0.50, 0.06, "",
-            transform=self.ax_traj.transAxes,
-            ha='left', va='bottom',
-            fontsize=9,
-            family='monospace',
-            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.88)
-        )
-
-        self.ax_traj.legend(loc='upper right', fontsize=8, framealpha=0.9)
-        self.fig_traj.tight_layout()
-        self.fig_traj.canvas.draw()
-        self.fig_traj.canvas.flush_events()
-
-    # ---------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------
-    def add_event(self, text):
-        if self.start_time is None:
-            stamp = 0.0
-        else:
-            stamp = self.now_sec() - self.start_time
-        self.event_log.append(f"[{stamp:6.2f}s] {text}")
-        if len(self.event_log) > self.max_event_lines:
-            self.event_log = self.event_log[-self.max_event_lines:]
+    def leader_position(self, travel):
+        travel = clamp(travel, 0.0, self.total_dist)
+        ratio = travel / self.total_dist
+        x = self.vl_start_x + (self.vl_goal_x - self.vl_start_x) * ratio
+        y = self.vl_start_y + (self.vl_goal_y - self.vl_start_y) * ratio
+        return x, y
 
     def same_obstacle(self, a, b, tol=1e-6):
         if a is None and b is None:
@@ -260,112 +210,72 @@ class SwarmTrajectoryVisualizer(Node):
             abs(a['hy'] - b['hy']) < tol
         )
 
-    def leader_position(self, travel):
-        travel = clamp(travel, 0.0, self.total_dist)
-        ratio = travel / self.total_dist
-        x = self.vl_start_x + (self.vl_goal_x - self.vl_start_x) * ratio
-        y = self.vl_start_y + (self.vl_goal_y - self.vl_start_y) * ratio
-        return x, y
+    def color_for_robot(self, idx):
+        palette = [
+            (0.10, 0.40, 1.00),
+            (0.10, 0.80, 0.20),
+            (1.00, 0.55, 0.10),
+            (0.85, 0.15, 0.85),
+        ]
+        return palette[idx % len(palette)]
 
-    def log_events(self, obstacle_status, mode_status):
-        obstacle_count = len(self.detected_obstacles) if obstacle_status != "STALE" else 0
-        mode_label = self.current_mode if mode_status != "STALE" else "stale"
+    def make_point(self, x, y, z=0.0):
+        p = Point()
+        p.x = float(x)
+        p.y = float(y)
+        p.z = float(z)
+        return p
 
-        if self.last_logged_mode is None:
-            self.last_logged_mode = mode_label
-            self.add_event(f"Initial mode: {mode_label}")
-        elif mode_label != self.last_logged_mode:
-            self.add_event(f"Mode changed: {self.last_logged_mode} -> {mode_label}")
-            self.last_logged_mode = mode_label
+    def make_marker(self, ns, mid, mtype):
+        m = Marker()
+        m.header.frame_id = self.frame_id
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = ns
+        m.id = mid
+        m.type = mtype
+        m.action = Marker.ADD
+        m.pose.orientation.w = 1.0
+        return m
 
-        if self.last_logged_obstacle_count is None:
-            self.last_logged_obstacle_count = obstacle_count
-            self.add_event(f"Detected obstacles: {obstacle_count}")
-        elif obstacle_count != self.last_logged_obstacle_count:
-            self.add_event(f"Detected obstacles changed: {self.last_logged_obstacle_count} -> {obstacle_count}")
-            self.last_logged_obstacle_count = obstacle_count
+    def append_trail_point_if_needed(self, trail, x, y):
+        if not trail:
+            trail.append(self.make_point(x, y, 0.0))
+            return
 
-        active = self.active_obstacle if mode_status != "STALE" else None
-        if not self.same_obstacle(active, self.last_logged_active_obstacle):
-            if active is None:
-                self.add_event("Active obstacle cleared")
-            else:
-                self.add_event("Active obstacle:")
-                self.add_event(
-                    f"x={active['cx']:.2f},y={active['cy']:.2f}, "
-                    f"hx={active['hx']:.2f},hy={active['hy']:.2f}"
-                )
-            self.last_logged_active_obstacle = None if active is None else dict(active)
+        last = trail[-1]
+        if math.hypot(x - last.x, y - last.y) > self.traj_append_dist:
+            trail.append(self.make_point(x, y, 0.0))
 
-    def clear_obstacle_artists(self):
-        for rect in self.obstacle_rects:
-            rect.remove()
-        for txt in self.obstacle_texts:
-            txt.remove()
+    def trim_obsolete_ids(self, markers, ns, used_count, max_count):
+        """
+        Publish DELETE markers for IDs that may have existed previously but are no longer used.
+        This avoids stale obstacle labels/cubes staying visible in RViz.
+        """
+        for mid in range(used_count, max_count):
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = ns
+            m.id = mid
+            m.action = Marker.DELETE
+            markers.markers.append(m)
 
-        self.obstacle_rects = []
-        self.obstacle_texts = []
+    def build_status_lines(self, now, obstacles_are_fresh, mode_is_fresh, active_is_fresh):
+        lines = []
 
-        if self.active_obstacle_rect is not None:
-            self.active_obstacle_rect.remove()
-            self.active_obstacle_rect = None
+        lines.append(f"Mode: {self.current_mode if mode_is_fresh else 'unknown'}")
+        lines.append(f"Gain: {self.current_mode_gain:.2f}" if mode_is_fresh else "Gain: 0.00")
+        lines.append(f"Obstacles: {len(self.detected_obstacles) if obstacles_are_fresh else 0}")
 
-    def rebuild_obstacle_artists(self, shown_active, obstacles_are_fresh):
-        self.clear_obstacle_artists()
+        if active_is_fresh and self.active_obstacle is not None:
+            a = self.active_obstacle
+            lines.append(f"Obs c=({a['cx']:.2f}, {a['cy']:.2f})")
+            lines.append(f"Obs h=({a['hx']:.2f}, {a['hy']:.2f})")
+        else:
+            lines.append("Obs:")
+            lines.append("")
 
-        if obstacles_are_fresh:
-            for idx, obs in enumerate(self.detected_obstacles):
-                rect = patches.Rectangle(
-                    (obs['cx'] - obs['hx'], obs['cy'] - obs['hy']),
-                    2.0 * obs['hx'],
-                    2.0 * obs['hy'],
-                    facecolor='orange',
-                    edgecolor='black',
-                    linewidth=1.2,
-                    alpha=0.35
-                )
-                self.ax_traj.add_patch(rect)
-                self.obstacle_rects.append(rect)
-
-                txt = self.ax_traj.text(
-                    obs['cx'],
-                    obs['cy'],
-                    f"O{idx+1}",
-                    ha='center',
-                    va='center',
-                    fontsize=9,
-                    weight='bold'
-                )
-                self.obstacle_texts.append(txt)
-
-        if shown_active is not None:
-            self.active_obstacle_rect = patches.Rectangle(
-                (shown_active['cx'] - shown_active['hx'], shown_active['cy'] - shown_active['hy']),
-                2.0 * shown_active['hx'],
-                2.0 * shown_active['hy'],
-                fill=False,
-                edgecolor='red',
-                linewidth=3.0,
-                linestyle='--'
-            )
-            self.ax_traj.add_patch(self.active_obstacle_rect)
-
-    def rebuild_quivers(self):
-        for name in self.robots:
-            if self.quivers[name] is not None:
-                self.quivers[name].remove()
-
-            cx, cy = self.current_pos[name]
-            fx, fy = self.current_force[name]
-
-            self.quivers[name] = self.ax_traj.quiver(
-                cx, cy, fx, fy,
-                angles='xy',
-                scale_units='xy',
-                scale=1.0,
-                color='black',
-                width=0.004
-            )
+        return lines
 
     # ---------------------------------------------------------
     # Callbacks
@@ -374,22 +284,18 @@ class SwarmTrajectoryVisualizer(Node):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
 
+        self.current_pos[name] = [x, y]
+
         if not self.have_odom[name]:
             self.have_odom[name] = True
             self.get_logger().info(f"Received first odometry from {name}")
 
-        if self.start_time is None and all(self.have_odom.values()):
-            self.start_time = self.now_sec()
-            self.vl_start_time = self.start_time + self.warmup_duration
-            self.get_logger().info(
-                f"All robot odometry received. Visualizer virtual leader will start after {self.warmup_duration:.2f}s warmup."
-            )
+            if all(self.have_odom.values()) and not self.have_global_start_time:
+                self.get_logger().info(
+                    "All robot odometry available. Waiting for global swarm start time."
+                )
 
-        if not self.traj_x[name] or math.hypot(x - self.traj_x[name][-1], y - self.traj_y[name][-1]) > self.traj_append_dist:
-            self.traj_x[name].append(x)
-            self.traj_y[name].append(y)
-
-        self.current_pos[name] = [x, y]
+        self.append_trail_point_if_needed(self.trails[name], x, y)
 
     def force_callback(self, msg, name):
         self.current_force[name] = [msg.x, msg.y]
@@ -399,6 +305,7 @@ class SwarmTrajectoryVisualizer(Node):
             curr_t = 0.0
         else:
             curr_t = self.now_sec() - self.start_time
+
         self.time_history[name].append(curr_t)
         self.cmd_linear_history[name].append(msg.linear.x)
         self.cmd_angular_history[name].append(msg.angular.z)
@@ -447,12 +354,25 @@ class SwarmTrajectoryVisualizer(Node):
             'hy': 0.5 * abs(msg.scale.y),
         }
 
+    def global_motion_start_time_callback(self, msg):
+        new_start_time = float(msg.data)
+
+        if not self.have_global_start_time:
+            self.vl_start_time = new_start_time
+            self.start_time = new_start_time - self.warmup_duration
+            self.have_global_start_time = True
+
+            self.get_logger().info(
+                f"Visualizer received global motion start time {self.vl_start_time:.3f} s"
+            )
+
     # ---------------------------------------------------------
-    # Plot update
+    # Marker publishing
     # ---------------------------------------------------------
-    def update_plot(self):
+    def publish_markers(self):
+        now = self.now_sec()
+
         if self.vl_start_time is None:
-            t = 0.0
             travel = 0.0
         else:
             t = self.now_sec() - self.vl_start_time
@@ -461,12 +381,7 @@ class SwarmTrajectoryVisualizer(Node):
             travel = min(self.vl_speed * t, self.total_dist)
 
         vl_x, vl_y = self.leader_position(travel)
-
-        if not self.ghost_traj_x or math.hypot(vl_x - self.ghost_traj_x[-1], vl_y - self.ghost_traj_y[-1]) > self.traj_append_dist:
-            self.ghost_traj_x.append(vl_x)
-            self.ghost_traj_y.append(vl_y)
-
-        now = self.now_sec()
+        self.append_trail_point_if_needed(self.ghost_trail, vl_x, vl_y)
 
         obstacles_are_fresh = (
             self.last_obstacle_update_time is not None and
@@ -483,129 +398,304 @@ class SwarmTrajectoryVisualizer(Node):
             (now - self.last_active_obstacle_time) <= self.mode_timeout
         )
 
-        if obstacles_are_fresh and len(self.detected_obstacles) > 0:
-            obstacle_status = "DETECTED"
-        elif obstacles_are_fresh:
-            obstacle_status = "NO OBSTACLE"
-        else:
-            obstacle_status = "STALE"
-
-        mode_status = "FRESH" if mode_is_fresh else "STALE"
-        shown_mode = self.current_mode if mode_is_fresh else "unknown"
-        shown_gain = self.current_mode_gain if mode_is_fresh else 0.0
         shown_active = self.active_obstacle if active_is_fresh else None
 
-        self.log_events(obstacle_status, mode_status)
+        markers = MarkerArray()
 
-        current_signature = (
-            tuple((o['cx'], o['cy'], o['hx'], o['hy']) for o in self.detected_obstacles) if obstacles_are_fresh else tuple(),
-            None if shown_active is None else (shown_active['cx'], shown_active['cy'], shown_active['hx'], shown_active['hy'])
+        # -----------------------------------------------------
+        # Goal marker
+        # -----------------------------------------------------
+        m = self.make_marker('goal', 0, Marker.SPHERE)
+        m.pose.position.x = self.vl_goal_x
+        m.pose.position.y = self.vl_goal_y
+        m.pose.position.z = 0.0
+        m.scale.x = 0.35
+        m.scale.y = 0.35
+        m.scale.z = 0.35
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Goal label
+        # -----------------------------------------------------
+        m = self.make_marker('goal_label', 0, Marker.TEXT_VIEW_FACING)
+        m.pose.position.x = self.vl_goal_x
+        m.pose.position.y = self.vl_goal_y + 0.5
+        m.pose.position.z = 1.0
+        m.scale.z = 0.35
+        m.color.r = 0.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        m.text = 'GOAL'
+        markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Virtual leader reference path
+        # -----------------------------------------------------
+        m = self.make_marker('virtual_leader_reference', 0, Marker.LINE_STRIP)
+        m.scale.x = self.reference_path_width
+        m.color.r = 0.55
+        m.color.g = 0.55
+        m.color.b = 0.55
+        m.color.a = 0.85
+        m.points = [
+            self.make_point(self.vl_start_x, self.vl_start_y, 0.01),
+            self.make_point(self.vl_goal_x, self.vl_goal_y, 0.01),
+        ]
+        markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Virtual leader traversed trajectory
+        # -----------------------------------------------------
+        m = self.make_marker('virtual_leader_traj', 0, Marker.LINE_STRIP)
+        m.scale.x = self.ghost_trail_width
+        m.color.r = 0.35
+        m.color.g = 0.35
+        m.color.b = 0.35
+        m.color.a = 1.0
+        m.points = self.ghost_trail
+        markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Virtual leader current marker
+        # -----------------------------------------------------
+        m = self.make_marker('virtual_leader_body', 0, Marker.SPHERE)
+        m.pose.position.x = vl_x
+        m.pose.position.y = vl_y
+        m.pose.position.z = 0.0
+        m.scale.x = 0.25
+        m.scale.y = 0.25
+        m.scale.z = 0.25
+        m.color.r = 0.45
+        m.color.g = 0.45
+        m.color.b = 0.45
+        m.color.a = 1.0
+        markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Robots
+        # -----------------------------------------------------
+        for idx, name in enumerate(self.robots):
+            x, y = self.current_pos[name]
+            fx, fy = self.current_force[name]
+            r, g, b = self.color_for_robot(idx)
+
+            # Robot body
+            m = self.make_marker('robots_body', idx, Marker.CYLINDER)
+            m.pose.position.x = x
+            m.pose.position.y = y
+            m.pose.position.z = 0.0
+            m.scale.x = self.d_safe
+            m.scale.y = self.d_safe
+            m.scale.z = self.robot_height
+            m.color.r = r
+            m.color.g = g
+            m.color.b = b
+            m.color.a = 0.85
+            markers.markers.append(m)
+
+            # Robot label
+            m = self.make_marker('robots_label', idx, Marker.TEXT_VIEW_FACING)
+            m.pose.position.x = x
+            m.pose.position.y = y + 0.5
+            m.pose.position.z = self.robot_label_z
+            m.scale.z = 0.35
+            m.color.r = 0.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            m.text = name
+            markers.markers.append(m)
+
+            # Robot trajectory
+            m = self.make_marker('robots_traj', idx, Marker.LINE_STRIP)
+            m.scale.x = self.trail_width
+            m.color.r = r
+            m.color.g = g
+            m.color.b = b
+            m.color.a = 1.0
+            m.points = self.trails[name]
+            markers.markers.append(m)
+
+            # Force vector arrow
+            m = self.make_marker('robots_force', idx, Marker.ARROW)
+            m.points = [
+                self.make_point(x, y, self.force_z),
+                self.make_point(x + self.force_scale * fx, y + self.force_scale * fy, self.force_z),
+            ]
+            m.scale.x = 0.03
+            m.scale.y = 0.07
+            m.scale.z = 0.10
+            m.color.r = 0.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Detected obstacles
+        # -----------------------------------------------------
+        if obstacles_are_fresh:
+            for idx, obs in enumerate(self.detected_obstacles):
+                m = self.make_marker('obstacles', idx, Marker.CUBE)
+                m.pose.position.x = obs['cx']
+                m.pose.position.y = obs['cy']
+                m.pose.position.z = 0.0
+                m.scale.x = 2.0 * obs['hx']
+                m.scale.y = 2.0 * obs['hy']
+                m.scale.z = self.obstacle_height
+                m.color.r = 1.0
+                m.color.g = 0.60
+                m.color.b = 0.00
+                m.color.a = 0.35
+                markers.markers.append(m)
+
+                m = self.make_marker('obstacles_label', idx, Marker.TEXT_VIEW_FACING)
+                m.pose.position.x = obs['cx']
+                m.pose.position.y = obs['cy']
+                m.pose.position.z = self.obstacle_height * 0.7 + 0.15
+                m.scale.z = 0.35
+                m.color.r = 0.0
+                m.color.g = 0.0
+                m.color.b = 0.0
+                m.color.a = 1.0
+                m.text = f'O{idx+1}'
+                markers.markers.append(m)
+
+        # Delete stale obstacle markers that might remain from a previous larger set
+        max_obstacle_slots = 64
+        used_obstacles = len(self.detected_obstacles) if obstacles_are_fresh else 0
+        self.trim_obsolete_ids(markers, 'obstacles', used_obstacles, max_obstacle_slots)
+        self.trim_obsolete_ids(markers, 'obstacles_label', used_obstacles, max_obstacle_slots)
+
+        # -----------------------------------------------------
+        # Active obstacle highlight
+        # -----------------------------------------------------
+        if shown_active is not None:
+            # translucent box
+            m = self.make_marker('active_obstacle_fill', 0, Marker.CUBE)
+            m.pose.position.x = shown_active['cx']
+            m.pose.position.y = shown_active['cy']
+            m.pose.position.z = 0.01
+            m.scale.x = 2.0 * shown_active['hx'] + 0.04
+            m.scale.y = 2.0 * shown_active['hy'] + 0.04
+            m.scale.z = self.obstacle_height + 0.04
+            m.color.r = 1.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 0.18
+            markers.markers.append(m)
+
+            # outline using LINE_STRIP
+            x0 = shown_active['cx'] - shown_active['hx'] - 0.02
+            x1 = shown_active['cx'] + shown_active['hx'] + 0.02
+            y0 = shown_active['cy'] - shown_active['hy'] - 0.02
+            y1 = shown_active['cy'] + shown_active['hy'] + 0.02
+            z = self.obstacle_height * 0.55
+
+            m = self.make_marker('active_obstacle_outline', 0, Marker.LINE_STRIP)
+            m.scale.x = 0.05
+            m.color.r = 1.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            m.points = [
+                self.make_point(x0, y0, z),
+                self.make_point(x1, y0, z),
+                self.make_point(x1, y1, z),
+                self.make_point(x0, y1, z),
+                self.make_point(x0, y0, z),
+            ]
+            markers.markers.append(m)
+        else:
+            # Remove active highlight markers when no active obstacle
+            for ns in ('active_obstacle_fill', 'active_obstacle_outline'):
+                m = Marker()
+                m.header.frame_id = self.frame_id
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = ns
+                m.id = 0
+                m.action = Marker.DELETE
+                markers.markers.append(m)
+
+        # -----------------------------------------------------
+        # Status text in RViz (2-column layout)
+        # -----------------------------------------------------
+        status_lines = self.build_status_lines(
+            now=now,
+            obstacles_are_fresh=obstacles_are_fresh,
+            mode_is_fresh=mode_is_fresh,
+            active_is_fresh=active_is_fresh
         )
 
-        if not hasattr(self, '_last_obstacle_signature') or self._last_obstacle_signature != current_signature:
-            self._last_obstacle_signature = current_signature
-            self.rebuild_obstacle_artists(shown_active, obstacles_are_fresh)
+        label_x = self.status_text_x
+        value_x = self.status_text_x + 1.0
+        line_spacing = self.status_line_spacing
 
-        status_lines = [
-            "Mode source: global",
-            f"Mode: {shown_mode}",
-            f"Mode gain: {shown_gain:.2f}",
-            f"Detected obstacles: {len(self.detected_obstacles) if obstacles_are_fresh else 0}",
-        ]
+        max_status_lines = 8
 
-        if self.vl_start_time is None:
-            status_lines.append("Virtual leader: waiting for odom")
-        else:
-            wait_left = self.vl_start_time - now
-            if wait_left > 0.0:
-                status_lines.append(f"Virtual leader start in: {wait_left:.2f}s")
+        for i, line in enumerate(status_lines):
+            if ':' in line:
+                label, value = line.split(':', 1)
+            else:
+                label, value = line, ''
 
-        if obstacles_are_fresh and self.detected_obstacles:
-            obstacle_lines = ["Detected obstacle boxes:"]
-            for i, obs in enumerate(self.detected_obstacles[:6]):
-                mark = "*" if self.same_obstacle(obs, shown_active) else " "
-                obstacle_lines.append(
-                    f"{mark} O{i+1}: c=({obs['cx']:.2f},{obs['cy']:.2f}) "
-                    f"h=({obs['hx']:.2f},{obs['hy']:.2f})"
-                )
-        else:
-            obstacle_lines = ["Detected obstacle boxes:", "none"]
+            y = self.status_text_y - i * line_spacing
 
-        event_lines = ["Recent events:"] + self.event_log[-self.max_event_lines:]
+            # label marker
+            m = self.make_marker('status_label', i, Marker.TEXT_VIEW_FACING)
+            m.pose.position.x = label_x
+            m.pose.position.y = y
+            m.pose.position.z = self.status_text_z
+            m.scale.z = self.status_text_size
+            m.color.r = 0.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            m.text = label + ':'
+            markers.markers.append(m)
 
-        self.status_text.set_text("\n".join(status_lines))
-        self.obstacle_list_text.set_text("\n".join(obstacle_lines))
-        self.event_text.set_text("\n".join(event_lines))
+            # value marker
+            m = self.make_marker('status_value', i, Marker.TEXT_VIEW_FACING)
+            m.pose.position.x = value_x
+            m.pose.position.y = y
+            m.pose.position.z = self.status_text_z
+            m.scale.z = self.status_text_size
+            m.color.r = 0.0
+            m.color.g = 0.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            m.text = value.strip()
+            markers.markers.append(m)
 
-        self.ghost_line.set_data(self.ghost_traj_x, self.ghost_traj_y)
-        self.ghost_marker.center = (vl_x, vl_y)
+        # delete old unused markers
+        for i in range(len(status_lines), max_status_lines):
+            for ns in ('status_label', 'status_value'):
+                m = Marker()
+                m.header.frame_id = self.frame_id
+                m.header.stamp = self.get_clock().now().to_msg()
+                m.ns = ns
+                m.id = i
+                m.action = Marker.DELETE
+                markers.markers.append(m)
 
-        for name in self.robots:
-            self.lines[name].set_data(self.traj_x[name], self.traj_y[name])
+        
 
-            cx, cy = self.current_pos[name]
-            self.circles[name].center = (cx, cy)
-            self.robot_labels[name].set_position((cx + 0.10, cy + 0.10))
-
-        self.rebuild_quivers()
-
-        self.fig_traj.canvas.draw_idle()
-        self.fig_traj.canvas.flush_events()
-
-    # ---------------------------------------------------------
-    # Final report
-    # ---------------------------------------------------------
-    def plot_final_results(self):
-        plt.ioff()
-
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        folder_name = f"test_run_{timestamp}"
-        os.makedirs(folder_name, exist_ok=True)
-
-        traj_path = os.path.join(folder_name, 'trajectory_map.png')
-        self.fig_traj.savefig(traj_path, dpi=200, bbox_inches='tight')
-        print(f"[Visualizer] Trajectory map saved to {traj_path}")
-
-        fig_cmd, axs = plt.subplots(len(self.robots), 1, figsize=(10, 12), sharex=True)
-        fig_cmd.suptitle(f'Command Profiles - {timestamp}', fontsize=16)
-
-        for i, name in enumerate(self.robots):
-            axs[i].plot(
-                self.time_history[name],
-                self.cmd_linear_history[name],
-                label='cmd.linear.x',
-                color='blue',
-                alpha=0.85
-            )
-            axs[i].plot(
-                self.time_history[name],
-                self.cmd_angular_history[name],
-                label='cmd.angular.z',
-                color='red',
-                alpha=0.85
-            )
-            axs[i].set_ylabel(name)
-            axs[i].grid(True)
-            axs[i].legend(loc='upper right')
-
-        axs[-1].set_xlabel('Time (s)')
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-
-        cmd_path = os.path.join(folder_name, 'command_profile.png')
-        fig_cmd.savefig(cmd_path, dpi=200, bbox_inches='tight')
-        print(f"[Visualizer] Command profile saved to {cmd_path}")
-
-        plt.show()
+        # Publish
+        self.marker_pub.publish(markers)
 
 
 def main():
     rclpy.init()
-    node = SwarmTrajectoryVisualizer()
+    node = SwarmRvizVisualizer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        print("\n[Visualizer] Simulation stopped. Generating final report...")
-        node.plot_final_results()
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()

@@ -20,7 +20,7 @@
 
     <gui fullscreen='0'>
       <camera name='user_camera'>
-        <pose>7.0 -2.5 8.0 0 0.8 2.5</pose>
+        <pose>19.0 -11.8 14.0 0.0 0.46 2.42</pose>
         <view_controller>orbit</view_controller>
       </camera>
     </gui>

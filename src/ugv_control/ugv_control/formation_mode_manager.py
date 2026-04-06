@@ -2,9 +2,10 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -17,64 +18,39 @@ class FormationModeManager(Node):
         super().__init__('formation_mode_manager')
 
         # ---------------------------------------------------------
-        # Parameters
+        # Parameters (mandatory from YAML / launch)
         # ---------------------------------------------------------
-        self.declare_parameter('vl_start_x', 0.0)
-        self.declare_parameter('vl_start_y', 0.0)
-        self.declare_parameter('vl_goal_x', 10.0)
-        self.declare_parameter('vl_goal_y', 10.0)
-        self.declare_parameter('vl_speed', 0.25)
+        self.vl_start_x = self.reqf('vl_start_x')
+        self.vl_start_y = self.reqf('vl_start_y')
+        self.vl_goal_x = self.reqf('vl_goal_x')
+        self.vl_goal_y = self.reqf('vl_goal_y')
+        self.vl_speed = self.reqf('vl_speed')
 
-        self.declare_parameter('control_period', 0.05)
-        self.declare_parameter('warmup_duration', 2.0)
+        self.control_period = self.reqf('control_period')
+        self.warmup_duration = self.reqf('warmup_duration')
 
-        self.declare_parameter('obstacle_topic', '/detected_obstacles')
-        self.declare_parameter('obstacle_timeout', 1.0)
-        self.declare_parameter('world_frame_id', 'map')
+        self.obstacle_topic = self.reqs('obstacle_topic')
+        self.obstacle_timeout = self.reqf('obstacle_timeout')
+        self.world_frame_id = self.reqs('world_frame_id')
 
-        self.declare_parameter('mode_enter_lookahead', 1.8)
-        self.declare_parameter('mode_exit_lookahead', 1.0)
-        self.declare_parameter('corridor_margin', 0.20)
-        self.declare_parameter('split_center_threshold', 0.30)
-        self.declare_parameter('split_center_hysteresis', 0.12)
+        self.mode_enter_lookahead = self.reqf('mode_enter_lookahead')
+        self.mode_exit_lookahead = self.reqf('mode_exit_lookahead')
+        self.corridor_margin = self.reqf('corridor_margin')
+        self.split_center_threshold = self.reqf('split_center_threshold')
+        self.split_center_hysteresis = self.reqf('split_center_hysteresis')
 
-        self.declare_parameter('obstacle_pass_clearance', 0.8)
-        self.declare_parameter('recovery_hold_time', 0.8)
+        self.obstacle_pass_clearance = self.reqf('obstacle_pass_clearance')
+        self.recovery_hold_time = self.reqf('recovery_hold_time')
 
-        # smarter deformation logic
-        self.declare_parameter('formation_obstacle_margin', 0.15)
-        self.declare_parameter('max_shift_amount', 1.8)
-        self.declare_parameter('max_split_extra', 1.3)
-        self.declare_parameter('min_shift_amount', 0.0)
-        self.declare_parameter('min_split_extra', 0.0)
+        self.formation_obstacle_margin = self.reqf('formation_obstacle_margin')
+        self.max_shift_amount = self.reqf('max_shift_amount')
+        self.max_split_extra = self.reqf('max_split_extra')
+        self.min_shift_amount = self.reqf('min_shift_amount')
+        self.min_split_extra = self.reqf('min_split_extra')
 
-        self.vl_start_x = float(self.get_parameter('vl_start_x').value)
-        self.vl_start_y = float(self.get_parameter('vl_start_y').value)
-        self.vl_goal_x = float(self.get_parameter('vl_goal_x').value)
-        self.vl_goal_y = float(self.get_parameter('vl_goal_y').value)
-        self.vl_speed = float(self.get_parameter('vl_speed').value)
-
-        self.control_period = float(self.get_parameter('control_period').value)
-        self.warmup_duration = float(self.get_parameter('warmup_duration').value)
-
-        self.obstacle_topic = str(self.get_parameter('obstacle_topic').value)
-        self.obstacle_timeout = float(self.get_parameter('obstacle_timeout').value)
-        self.world_frame_id = str(self.get_parameter('world_frame_id').value)
-
-        self.mode_enter_lookahead = float(self.get_parameter('mode_enter_lookahead').value)
-        self.mode_exit_lookahead = float(self.get_parameter('mode_exit_lookahead').value)
-        self.corridor_margin = float(self.get_parameter('corridor_margin').value)
-        self.split_center_threshold = float(self.get_parameter('split_center_threshold').value)
-        self.split_center_hysteresis = float(self.get_parameter('split_center_hysteresis').value)
-
-        self.obstacle_pass_clearance = float(self.get_parameter('obstacle_pass_clearance').value)
-        self.recovery_hold_time = float(self.get_parameter('recovery_hold_time').value)
-
-        self.formation_obstacle_margin = float(self.get_parameter('formation_obstacle_margin').value)
-        self.max_shift_amount = float(self.get_parameter('max_shift_amount').value)
-        self.max_split_extra = float(self.get_parameter('max_split_extra').value)
-        self.min_shift_amount = float(self.get_parameter('min_shift_amount').value)
-        self.min_split_extra = float(self.get_parameter('min_split_extra').value)
+        # Robot body footprint (full dimensions)
+        self.robot_length = self.reqf('robot_length')
+        self.robot_width = self.reqf('robot_width')
 
         # ---------------------------------------------------------
         # Path geometry
@@ -101,7 +77,10 @@ class FormationModeManager(Node):
             'ugv4': ( 1.0,  0.0),
         }
 
-        self.nominal_longitudinal_radius, self.nominal_lateral_radius = self.compute_nominal_path_frame_radii()
+        (
+            self.nominal_longitudinal_radius,
+            self.nominal_lateral_radius
+        ) = self.compute_nominal_path_frame_radii()
 
         # ---------------------------------------------------------
         # State
@@ -121,6 +100,7 @@ class FormationModeManager(Node):
         self.have_odom = {name: False for name in self.robots}
         self.start_time = None
         self.vl_start_time = None
+        self.global_motion_start_time = None
 
         # ---------------------------------------------------------
         # ROS interfaces
@@ -131,6 +111,7 @@ class FormationModeManager(Node):
 
         self.shift_amount_pub = self.create_publisher(Float32, '/formation_shift_amount_global', 10)
         self.split_extra_pub = self.create_publisher(Float32, '/formation_split_extra_global', 10)
+        self.motion_start_pub = self.create_publisher(Float64, '/swarm_motion_start_time', 10)
 
         self.create_subscription(
             MarkerArray,
@@ -149,7 +130,36 @@ class FormationModeManager(Node):
 
         self.timer = self.create_timer(self.control_period, self.control_loop)
 
-        self.get_logger().info('formation_mode_manager started. Waiting for all robot odometry...')
+        self.get_logger().info(
+            'formation_mode_manager started with mandatory YAML parameters loaded. '
+            f'Footprint-aware formation radii enabled: '
+            f'robot_length={self.robot_length:.3f}, '
+            f'robot_width={self.robot_width:.3f}, '
+            f'nominal_longitudinal_radius={self.nominal_longitudinal_radius:.3f}, '
+            f'nominal_lateral_radius={self.nominal_lateral_radius:.3f}. '
+            'Waiting for all robot odometry...'
+        )
+
+    # ---------------------------------------------------------
+    # Mandatory parameter helpers
+    # ---------------------------------------------------------
+    def require_param(self, name):
+        self.declare_parameter(name)
+        param = self.get_parameter(name)
+
+        if param.type_ == Parameter.Type.NOT_SET:
+            raise RuntimeError(
+                f"Required parameter '{name}' is missing for node "
+                f"'{self.get_name()}'. Provide it in the YAML config or launch file."
+            )
+
+        return param.value
+
+    def reqf(self, name):
+        return float(self.require_param(name))
+
+    def reqs(self, name):
+        return str(self.require_param(name))
 
     # ---------------------------------------------------------
     # Time
@@ -165,15 +175,30 @@ class FormationModeManager(Node):
         lateral = vx * self.path_nx + vy * self.path_ny
         return along, lateral
 
+    def body_half_extents_in_path_frame(self):
+        hx = 0.5 * self.robot_length
+        hy = 0.5 * self.robot_width
+
+        along_half = abs(self.path_ux) * hx + abs(self.path_uy) * hy
+        lateral_half = abs(self.path_nx) * hx + abs(self.path_ny) * hy
+
+        return along_half, lateral_half
+
     def compute_nominal_path_frame_radii(self):
         max_along = 0.0
         max_lateral = 0.0
 
+        body_along_half, body_lateral_half = self.body_half_extents_in_path_frame()
+
         for name in self.robots:
             bx, by = self.shape_base[name]
-            along, lateral = self.world_vec_to_path_frame(bx, by)
-            max_along = max(max_along, abs(along))
-            max_lateral = max(max_lateral, abs(lateral))
+            along_c, lateral_c = self.world_vec_to_path_frame(bx, by)
+
+            robot_along_extent = abs(along_c) + body_along_half
+            robot_lateral_extent = abs(lateral_c) + body_lateral_half
+
+            max_along = max(max_along, robot_along_extent)
+            max_lateral = max(max_lateral, robot_lateral_extent)
 
         return max_along, max_lateral
 
@@ -209,8 +234,11 @@ class FormationModeManager(Node):
         if self.start_time is None and all(self.have_odom.values()):
             self.start_time = self.now_sec()
             self.vl_start_time = self.start_time + self.warmup_duration
+            self.global_motion_start_time = self.vl_start_time
+
             self.get_logger().info(
-                f"All robot odometry received. Virtual leader will start after {self.warmup_duration:.2f}s warmup."
+                f"All robot odometry received. Global swarm motion start scheduled at "
+                f"{self.global_motion_start_time:.3f} s."
             )
 
     def obstacle_markers_callback(self, msg):
@@ -268,7 +296,11 @@ class FormationModeManager(Node):
         front_edge = along_c - along_h
         back_edge = along_c + along_h
 
-        lookahead = self.mode_exit_lookahead if self.formation_mode != 'normal' else self.mode_enter_lookahead
+        lookahead = (
+            self.mode_exit_lookahead
+            if self.formation_mode != 'normal'
+            else self.mode_enter_lookahead
+        )
 
         if back_edge < -0.4 or front_edge > lookahead:
             return 'normal'
@@ -298,7 +330,11 @@ class FormationModeManager(Node):
         along_c, lateral_c, along_h, lateral_h = self.obstacle_path_metrics(obs, travel)
 
         front_edge = max(0.0, along_c - along_h)
-        lookahead = self.mode_exit_lookahead if mode_name != 'normal' else self.mode_enter_lookahead
+        lookahead = (
+            self.mode_exit_lookahead
+            if mode_name != 'normal'
+            else self.mode_enter_lookahead
+        )
 
         proximity = 1.0 - clamp(front_edge / max(lookahead, 1e-3), 0.0, 1.0)
         proximity = proximity * proximity * (3.0 - 2.0 * proximity)
@@ -337,14 +373,10 @@ class FormationModeManager(Node):
         margin = self.formation_obstacle_margin
 
         if mode_name == 'shift_right':
-            # Move formation to the right of the obstacle
-            # formation left edge should be right of obstacle right edge + margin
             req = lateral_c + lateral_h + margin + self.nominal_lateral_radius
             return clamp(req, self.min_shift_amount, self.max_shift_amount)
 
         if mode_name == 'shift_left':
-            # Move formation to the left of the obstacle
-            # formation right edge should be left of obstacle left edge - margin
             req = -lateral_c + lateral_h + margin + self.nominal_lateral_radius
             return clamp(req, self.min_shift_amount, self.max_shift_amount)
 
@@ -357,14 +389,17 @@ class FormationModeManager(Node):
         _, _, _, lateral_h = self.obstacle_path_metrics(obs, travel)
         margin = self.formation_obstacle_margin
 
-        # extra opening beyond nominal half-width
         extra = lateral_h + margin - self.nominal_lateral_radius
         extra = max(0.0, extra)
         return clamp(extra, self.min_split_extra, self.max_split_extra)
 
     def update_dynamic_deformation(self, obs, travel, mode_name):
         if mode_name in ('shift_left', 'shift_right'):
-            self.dynamic_shift_amount = self.compute_required_shift_amount(obs, travel, mode_name)
+            self.dynamic_shift_amount = self.compute_required_shift_amount(
+                obs,
+                travel,
+                mode_name
+            )
             self.dynamic_split_extra = 0.0
         elif mode_name == 'split':
             self.dynamic_shift_amount = 0.0
@@ -383,7 +418,11 @@ class FormationModeManager(Node):
             if self.recovery_hold_active():
                 obs = None
             else:
-                lookahead = self.mode_enter_lookahead if self.formation_mode == 'normal' else self.mode_exit_lookahead
+                lookahead = (
+                    self.mode_enter_lookahead
+                    if self.formation_mode == 'normal'
+                    else self.mode_exit_lookahead
+                )
                 obs = self.find_relevant_obstacle(travel, lookahead)
 
         new_mode = self.classify_mode_from_obstacle(obs, travel)
@@ -407,7 +446,8 @@ class FormationModeManager(Node):
         if new_mode != prev_mode:
             self.get_logger().info(
                 f"Formation mode changed: {prev_mode} -> {new_mode} | "
-                f"shift={self.dynamic_shift_amount:.2f}, split_extra={self.dynamic_split_extra:.2f}"
+                f"shift={self.dynamic_shift_amount:.2f}, "
+                f"split_extra={self.dynamic_split_extra:.2f}"
             )
 
         self.formation_mode = new_mode
@@ -417,6 +457,14 @@ class FormationModeManager(Node):
     # ---------------------------------------------------------
     # Publishers
     # ---------------------------------------------------------
+    def publish_motion_start_time(self):
+        if self.global_motion_start_time is None:
+            return
+
+        msg = Float64()
+        msg.data = float(self.global_motion_start_time)
+        self.motion_start_pub.publish(msg)
+
     def publish_mode_state(self):
         mode_msg = String()
         mode_msg.data = self.formation_mode
@@ -466,6 +514,9 @@ class FormationModeManager(Node):
     # ---------------------------------------------------------
     def control_loop(self):
         now = self.now_sec()
+
+        # Always republish shared start time so every robot eventually gets it
+        self.publish_motion_start_time()
 
         if self.last_obstacle_update_time is not None:
             if (now - self.last_obstacle_update_time) > self.obstacle_timeout:

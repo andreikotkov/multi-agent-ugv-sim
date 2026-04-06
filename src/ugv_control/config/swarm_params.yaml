@@ -1,0 +1,92 @@
+single_agent_node:
+  ros__parameters:
+    robot_name: ugv1
+
+    #start/goal positions
+    vl_start_x: 0.0
+    vl_start_y: 0.0
+    vl_goal_x: 10.0
+    vl_goal_y: 10.0
+    #maximum speed
+    vl_speed: 0.45
+
+    control_period: 0.1
+    warmup_duration: 2.0
+
+    obstacle_topic: /detected_obstacles
+    obstacle_timeout: 1.0
+    world_frame_id: map
+
+    #shift_amount
+    shift_longitudinal_scale: 0.98
+    #split_bias
+    split_lateral_scale: 1.03
+    split_longitudinal_scale: 0.98
+
+    offset_blend_alpha_obstacle: 0.08
+    offset_blend_alpha_recover: 0.25
+
+formation_mode_manager:
+  ros__parameters:
+    #start/goal positions
+    vl_start_x: 0.0
+    vl_start_y: 0.0
+    vl_goal_x: 10.0
+    vl_goal_y: 10.0
+    #maximum speed
+    vl_speed: 0.45
+
+    control_period: 0.05
+    warmup_duration: 2.0
+
+    obstacle_topic: /detected_obstacles
+    obstacle_timeout: 1.0
+    world_frame_id: map
+
+    mode_enter_lookahead: 0.8 #lookahed distance before formation
+    mode_exit_lookahead: 0.8  #lookahed distance in the formation
+    corridor_margin: 0.20
+    #smooth detecting and splitting
+    split_center_threshold: 0.30
+    split_center_hysteresis: 0.12
+  
+    #finish the avoidance
+    obstacle_pass_clearance: 0.8
+    recovery_hold_time: 0.8
+
+    formation_obstacle_margin: 0.15 #safe distance from obstacle
+    max_shift_amount: 3 #maximum shift amount
+    max_split_extra: 2  #maximum split amount
+    min_shift_amount: 0.0 #minimum shift amount
+    min_split_extra: 0.0  #minimum split amount
+
+    #ugvs dimensions
+    robot_length: 0.8
+    robot_width: 0.6
+
+#visualization obstacles and ugvs
+swarm_visualizer:
+  ros__parameters:
+    obstacle_timeout: 1.0
+    mode_timeout: 1.0
+
+    vl_start_x: 0.0
+    vl_start_y: 0.0
+    vl_goal_x: 10.0
+    vl_goal_y: 10.0
+    vl_speed: 0.45
+    warmup_duration: 2.0
+
+delayed_gazebo_obstacle_spawner:
+  ros__parameters:
+    spawn_delay_sec: 30.0
+
+    obstacle_name: delayed_rect_obstacle
+
+    obstacle_size_x: 3.0
+    obstacle_size_y: 1.0
+    obstacle_size_z: 1.0
+
+    obstacle_pos_x: 6.0
+    obstacle_pos_y: 8.5
+    obstacle_pos_z: 0.1

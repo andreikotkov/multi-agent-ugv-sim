@@ -14,6 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,6 +30,7 @@ setup(
             'global_obstacle_publisher = ugv_control.global_obstacle_publisher:main',
             'delayed_gazebo_obstacle_spawner = ugv_control.delayed_gazebo_obstacle_spawner:main',
             'formation_mode_manager = ugv_control.formation_mode_manager:main',
+            'swarm_plot_logger = ugv_control.swarm_plot_logger:main',
         ],
     },
 )

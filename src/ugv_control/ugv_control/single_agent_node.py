@@ -2,10 +2,11 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import Twist, Point
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -46,56 +47,31 @@ class SingleAgentController(Node):
         super().__init__('single_agent_controller')
 
         # ---------------------------------------------------------
-        # Parameters
+        # Parameters (mandatory from YAML / launch)
         # ---------------------------------------------------------
-        self.declare_parameter('robot_name', 'ugv1')
+        self.robot_name = self.reqs('robot_name')
 
-        self.declare_parameter('vl_start_x', 0.0)
-        self.declare_parameter('vl_start_y', 0.0)
-        self.declare_parameter('vl_goal_x', 10.0)
-        self.declare_parameter('vl_goal_y', 10.0)
-        self.declare_parameter('vl_speed', 0.25)
+        self.vl_start_x = self.reqf('vl_start_x')
+        self.vl_start_y = self.reqf('vl_start_y')
+        self.vl_goal_x = self.reqf('vl_goal_x')
+        self.vl_goal_y = self.reqf('vl_goal_y')
+        self.vl_speed = self.reqf('vl_speed')
 
-        self.declare_parameter('control_period', 0.1)
-        self.declare_parameter('warmup_duration', 2.0)
+        self.control_period = self.reqf('control_period')
+        self.warmup_duration = self.reqf('warmup_duration')
 
-        self.declare_parameter('obstacle_topic', '/detected_obstacles')
-        self.declare_parameter('obstacle_timeout', 1.0)
-        self.declare_parameter('world_frame_id', 'map')
+        self.obstacle_topic = self.reqs('obstacle_topic')
+        self.obstacle_timeout = self.reqf('obstacle_timeout')
+        self.world_frame_id = self.reqs('world_frame_id')
 
-        # kept as fallback / mild shape controls
-        self.declare_parameter('shift_amount', 0.85)
-        self.declare_parameter('shift_longitudinal_scale', 0.96)
-        self.declare_parameter('split_bias', 0.90)
-        self.declare_parameter('split_lateral_scale', 1.15)
-        self.declare_parameter('split_longitudinal_scale', 0.96)
+        # These shape the deformation, but the manager decides
+        # which mode to use and how strong the shift/split is.
+        self.shift_longitudinal_scale = self.reqf('shift_longitudinal_scale')
+        self.split_lateral_scale = self.reqf('split_lateral_scale')
+        self.split_longitudinal_scale = self.reqf('split_longitudinal_scale')
 
-        self.declare_parameter('offset_blend_alpha_obstacle', 0.15)
-        self.declare_parameter('offset_blend_alpha_recover', 0.40)
-
-        self.robot_name = self.get_parameter('robot_name').get_parameter_value().string_value
-
-        self.vl_start_x = float(self.get_parameter('vl_start_x').value)
-        self.vl_start_y = float(self.get_parameter('vl_start_y').value)
-        self.vl_goal_x = float(self.get_parameter('vl_goal_x').value)
-        self.vl_goal_y = float(self.get_parameter('vl_goal_y').value)
-        self.vl_speed = float(self.get_parameter('vl_speed').value)
-
-        self.control_period = float(self.get_parameter('control_period').value)
-        self.warmup_duration = float(self.get_parameter('warmup_duration').value)
-
-        self.obstacle_topic = str(self.get_parameter('obstacle_topic').value)
-        self.obstacle_timeout = float(self.get_parameter('obstacle_timeout').value)
-        self.world_frame_id = str(self.get_parameter('world_frame_id').value)
-
-        self.shift_amount = float(self.get_parameter('shift_amount').value)
-        self.shift_longitudinal_scale = float(self.get_parameter('shift_longitudinal_scale').value)
-        self.split_bias = float(self.get_parameter('split_bias').value)
-        self.split_lateral_scale = float(self.get_parameter('split_lateral_scale').value)
-        self.split_longitudinal_scale = float(self.get_parameter('split_longitudinal_scale').value)
-
-        self.offset_blend_alpha_obstacle = float(self.get_parameter('offset_blend_alpha_obstacle').value)
-        self.offset_blend_alpha_recover = float(self.get_parameter('offset_blend_alpha_recover').value)
+        self.offset_blend_alpha_obstacle = self.reqf('offset_blend_alpha_obstacle')
+        self.offset_blend_alpha_recover = self.reqf('offset_blend_alpha_recover')
 
         self.robots = ['ugv1', 'ugv2', 'ugv3', 'ugv4']
         if self.robot_name not in self.robots:
@@ -116,7 +92,7 @@ class SingleAgentController(Node):
         self.path_ny = self.path_ux
 
         # ---------------------------------------------------------
-        # Nominal world-frame rhombus
+        # Nominal formation shape
         # ---------------------------------------------------------
         self.shape_base = {
             'ugv1': (-1.0,  0.0),
@@ -125,12 +101,7 @@ class SingleAgentController(Node):
             'ugv4': ( 1.0,  0.0),
         }
 
-        self.split_bias_sign = {
-            'ugv1':  1.0,
-            'ugv2':  1.0,
-            'ugv3': -1.0,
-            'ugv4': -1.0,
-        }
+        self.split_side_sign = self.compute_split_side_signs()
 
         # ---------------------------------------------------------
         # Controller gains / safety
@@ -141,7 +112,7 @@ class SingleAgentController(Node):
 
         self.filtered_fx = 0.0
         self.filtered_fy = 0.0
-        self.force_filter_alpha = 0.25
+        self.force_filter_alpha = 0.18
 
         self.d_safe_robot = 0.65
         self.k_rep_robot = 0.7
@@ -152,13 +123,15 @@ class SingleAgentController(Node):
         self.max_speed = 0.65
         self.max_turn = 2.5
 
-        self.final_max_speed = 0.22
-        self.final_max_turn = 3.5
+        self.final_max_speed = 0.10
+        self.final_max_turn = 0.8
 
-        self.final_tol = 0.08
+        self.final_tol = 0.12
         self.all_settled_tol = 0.12
         self.force_deadband = 1e-3
-        self.rotate_in_place_angle = 0.4
+
+        # Smoother turning than before
+        self.rotate_in_place_angle = 0.65
 
         # ---------------------------------------------------------
         # State
@@ -180,18 +153,18 @@ class SingleAgentController(Node):
         self.formation_mode = 'normal'
         self.mode_gain = 0.0
         self.active_obstacle = None
-
-        # dynamic global deformation commands
-        self.dynamic_shift_amount = self.shift_amount
+        self.dynamic_shift_amount = 0.0
         self.dynamic_split_extra = 0.0
 
         self.current_offsets = {
             name: self.shape_base[name] for name in self.robots
         }
 
-        # synchronized global start trigger
+        # Shared synchronized start
         self.have_odom_all = {name: False for name in self.robots}
         self.motion_start_time = None
+        self.have_global_start_time = False
+        self.logged_waiting_for_global_start = False
 
         # ---------------------------------------------------------
         # ROS interfaces
@@ -199,7 +172,6 @@ class SingleAgentController(Node):
         self.cmd_pub = self.create_publisher(Twist, f'/{self.robot_name}/cmd_vel', 10)
         self.force_pub = self.create_publisher(Point, f'/{self.robot_name}/force_vector', 10)
 
-        # per-robot republishes for visualizer compatibility
         self.mode_pub = self.create_publisher(String, f'/{self.robot_name}/formation_mode', 10)
         self.mode_gain_pub = self.create_publisher(Float32, f'/{self.robot_name}/formation_mode_gain', 10)
         self.active_obstacle_pub = self.create_publisher(
@@ -208,7 +180,12 @@ class SingleAgentController(Node):
             10
         )
 
-        self.create_subscription(Odometry, f'/{self.robot_name}/odom', self.odom_callback, 10)
+        self.create_subscription(
+            Odometry,
+            f'/{self.robot_name}/odom',
+            self.odom_callback,
+            10
+        )
 
         for name in self.other_robots_pos.keys():
             self.create_subscription(
@@ -260,11 +237,41 @@ class SingleAgentController(Node):
             10
         )
 
+        self.create_subscription(
+            Float64,
+            '/swarm_motion_start_time',
+            self.global_motion_start_time_callback,
+            10
+        )
+
         self.timer = self.create_timer(self.control_period, self.control_loop)
 
         self.get_logger().info(
-            f"{self.robot_name} started. Waiting for synchronized swarm start."
+            f"{self.robot_name} started. "
+            f"Split side sign={self.split_side_sign[self.robot_name]:+.0f}. "
+            f"Waiting for synchronized swarm start."
         )
+
+    # ---------------------------------------------------------
+    # Mandatory parameter helpers
+    # ---------------------------------------------------------
+    def require_param(self, name):
+        self.declare_parameter(name)
+        param = self.get_parameter(name)
+
+        if param.type_ == Parameter.Type.NOT_SET:
+            raise RuntimeError(
+                f"Required parameter '{name}' is missing for node "
+                f"'{self.get_name()}'. Provide it in the YAML config or launch file."
+            )
+
+        return param.value
+
+    def reqf(self, name):
+        return float(self.require_param(name))
+
+    def reqs(self, name):
+        return str(self.require_param(name))
 
     # ---------------------------------------------------------
     # Time
@@ -285,6 +292,48 @@ class SingleAgentController(Node):
         wy = along * self.path_uy + lateral * self.path_ny
         return wx, wy
 
+    def compute_split_side_signs(self):
+        signs = {}
+
+        for name in self.robots:
+            bx, by = self.shape_base[name]
+            _, lateral = self.world_vec_to_path_frame(bx, by)
+
+            if lateral > 1e-6:
+                signs[name] = 1.0
+            elif lateral < -1e-6:
+                signs[name] = -1.0
+            else:
+                signs[name] = 1.0 if name in ('ugv1', 'ugv2') else -1.0
+
+        return signs
+
+    def current_behavior_scales(self):
+        """
+        Scale repulsion and smoothing based on manager-controlled formation mode.
+
+        The main idea:
+        - normal: full local repulsion, normal smoothing
+        - shift: manager already steers formation, so reduce local repulsion somewhat
+        - split: manager strongly prescribes geometry, so reduce local repulsion more
+        """
+        g = clamp(self.mode_gain, 0.0, 1.0)
+
+        if self.formation_mode == 'split':
+            obs_scale = 1.0 - 0.65 * g
+            robot_scale = 1.0 - 0.45 * g
+            force_alpha = 0.14
+        elif self.formation_mode in ('shift_left', 'shift_right'):
+            obs_scale = 1.0 - 0.40 * g
+            robot_scale = 1.0 - 0.25 * g
+            force_alpha = 0.16
+        else:
+            obs_scale = 1.0
+            robot_scale = 1.0
+            force_alpha = 0.18
+
+        return obs_scale, robot_scale, force_alpha
+
     # ---------------------------------------------------------
     # Callbacks
     # ---------------------------------------------------------
@@ -302,11 +351,10 @@ class SingleAgentController(Node):
             self.have_odom_all[self.robot_name] = True
             self.get_logger().info(f"{self.robot_name}: received first odometry from self")
 
-        if self.motion_start_time is None and all(self.have_odom_all.values()):
-            self.motion_start_time = self.now_sec() + self.warmup_duration
-            self.last_control_time = self.now_sec()
+        if all(self.have_odom_all.values()) and not self.have_global_start_time and not self.logged_waiting_for_global_start:
+            self.logged_waiting_for_global_start = True
             self.get_logger().info(
-                f"{self.robot_name}: all robot odometry received. Motion starts after {self.warmup_duration:.2f}s warmup."
+                f"{self.robot_name}: all odometry available, waiting for global start time."
             )
 
     def other_odom_callback(self, msg, name):
@@ -319,11 +367,10 @@ class SingleAgentController(Node):
             self.have_odom_all[name] = True
             self.get_logger().info(f"{self.robot_name}: received first odometry from {name}")
 
-        if self.motion_start_time is None and all(self.have_odom_all.values()):
-            self.motion_start_time = self.now_sec() + self.warmup_duration
-            self.last_control_time = self.now_sec()
+        if all(self.have_odom_all.values()) and not self.have_global_start_time and not self.logged_waiting_for_global_start:
+            self.logged_waiting_for_global_start = True
             self.get_logger().info(
-                f"{self.robot_name}: all robot odometry received. Motion starts after {self.warmup_duration:.2f}s warmup."
+                f"{self.robot_name}: all odometry available, waiting for global start time."
             )
 
     def obstacle_markers_callback(self, msg):
@@ -335,14 +382,11 @@ class SingleAgentController(Node):
             if marker.type != Marker.CUBE:
                 continue
 
-            hx = 0.5 * abs(marker.scale.x)
-            hy = 0.5 * abs(marker.scale.y)
-
             obstacles.append({
                 'cx': marker.pose.position.x,
                 'cy': marker.pose.position.y,
-                'hx': hx,
-                'hy': hy,
+                'hx': 0.5 * abs(marker.scale.x),
+                'hy': 0.5 * abs(marker.scale.y),
             })
 
         self.detected_obstacles = obstacles
@@ -375,6 +419,19 @@ class SingleAgentController(Node):
     def global_split_extra_callback(self, msg):
         self.dynamic_split_extra = float(msg.data)
 
+    def global_motion_start_time_callback(self, msg):
+        new_start_time = float(msg.data)
+
+        if not self.have_global_start_time:
+            self.motion_start_time = new_start_time
+            self.have_global_start_time = True
+            self.last_control_time = self.now_sec()
+
+            self.get_logger().info(
+                f"{self.robot_name}: received global motion start time "
+                f"{self.motion_start_time:.3f} s"
+            )
+
     # ---------------------------------------------------------
     # Leader and formation target generation
     # ---------------------------------------------------------
@@ -385,28 +442,48 @@ class SingleAgentController(Node):
         y = self.vl_start_y + (self.vl_goal_y - self.vl_start_y) * ratio
         return x, y
 
-    def get_desired_offset_for_robot(self, robot_name):
+    def nominal_offset_in_path_frame(self, robot_name):
         base_x, base_y = self.shape_base[robot_name]
-        along, lateral = self.world_vec_to_path_frame(base_x, base_y)
+        return self.world_vec_to_path_frame(base_x, base_y)
 
+    def apply_shift_deformation(self, along, lateral, shift_sign, gain):
+        along *= (1.0 - gain * (1.0 - self.shift_longitudinal_scale))
+        lateral += gain * shift_sign * self.dynamic_shift_amount
+        return along, lateral
+
+    def apply_split_deformation(self, robot_name, along, lateral, gain):
+        along *= (1.0 - gain * (1.0 - self.split_longitudinal_scale))
+        lateral *= (1.0 + gain * (self.split_lateral_scale - 1.0))
+        lateral += gain * self.dynamic_split_extra * self.split_side_sign[robot_name]
+        return along, lateral
+
+    def get_desired_offset_for_robot(self, robot_name):
+        along, lateral = self.nominal_offset_in_path_frame(robot_name)
         g = self.mode_gain
 
         if self.formation_mode == 'shift_left' and g > 1e-6:
-            along *= (1.0 - g * (1.0 - self.shift_longitudinal_scale))
-            lateral += g * self.dynamic_shift_amount
+            along, lateral = self.apply_shift_deformation(
+                along,
+                lateral,
+                shift_sign=+1.0,
+                gain=g
+            )
 
         elif self.formation_mode == 'shift_right' and g > 1e-6:
-            along *= (1.0 - g * (1.0 - self.shift_longitudinal_scale))
-            lateral -= g * self.dynamic_shift_amount
+            along, lateral = self.apply_shift_deformation(
+                along,
+                lateral,
+                shift_sign=-1.0,
+                gain=g
+            )
 
         elif self.formation_mode == 'split' and g > 1e-6:
-            along *= (1.0 - g * (1.0 - self.split_longitudinal_scale))
-
-            # keep mild shaping of nominal lateral structure
-            lateral *= (1.0 + g * (self.split_lateral_scale - 1.0))
-
-            # add only the extra opening actually needed for the obstacle
-            lateral += g * self.dynamic_split_extra * self.split_bias_sign[robot_name]
+            along, lateral = self.apply_split_deformation(
+                robot_name,
+                along,
+                lateral,
+                gain=g
+            )
 
         return self.path_frame_to_world(along, lateral)
 
@@ -450,8 +527,8 @@ class SingleAgentController(Node):
                     norm = math.hypot(dxo, dyo)
 
                     if norm < 1e-6:
-                        dxo = self.path_nx * self.split_bias_sign[self.robot_name]
-                        dyo = self.path_ny * self.split_bias_sign[self.robot_name]
+                        dxo = self.path_nx * self.split_side_sign[self.robot_name]
+                        dyo = self.path_ny * self.split_side_sign[self.robot_name]
                         norm = 1.0
 
                     dxo /= norm
@@ -540,7 +617,7 @@ class SingleAgentController(Node):
             self.stop_robot()
             return
 
-        if self.motion_start_time is None:
+        if not self.have_global_start_time or self.motion_start_time is None:
             self.stop_robot()
             return
 
@@ -558,7 +635,10 @@ class SingleAgentController(Node):
             self.stop_robot()
             return
 
-        if self.last_obstacle_update_time is not None and (now - self.last_obstacle_update_time) > self.obstacle_timeout:
+        if (
+            self.last_obstacle_update_time is not None and
+            (now - self.last_obstacle_update_time) > self.obstacle_timeout
+        ):
             self.detected_obstacles = []
 
         current_travel = min(self.vl_speed * t, self.total_dist)
@@ -566,7 +646,10 @@ class SingleAgentController(Node):
 
         self.update_smoothed_offsets()
 
-        my_target_x, my_target_y = self.get_target_for_robot(self.robot_name, current_travel)
+        my_target_x, my_target_y = self.get_target_for_robot(
+            self.robot_name,
+            current_travel
+        )
 
         next_leader_x, next_leader_y = self.leader_position(next_travel)
         my_off_x, my_off_y = self.current_offsets[self.robot_name]
@@ -578,13 +661,22 @@ class SingleAgentController(Node):
 
         ex = my_target_x - self.current_x
         ey = my_target_y - self.current_y
-
-        f_att_x = self.k_att * ex + self.k_ff * ff_vx
-        f_att_y = self.k_att * ey + self.k_ff * ff_vy
-
+        
         dist_to_my_target = math.hypot(ex, ey)
         is_leader_at_goal = (current_travel >= self.total_dist - 1e-6)
 
+        if is_leader_at_goal:
+            f_att_x = self.k_att * ex
+            f_att_y = self.k_att * ey
+        else:
+            f_att_x = self.k_att * ex + self.k_ff * ff_vx
+            f_att_y = self.k_att * ey + self.k_ff * ff_vy
+
+        
+
+        obs_scale, robot_scale, force_alpha = self.current_behavior_scales()
+
+        # Robot-robot repulsion
         f_rep_x = 0.0
         f_rep_y = 0.0
 
@@ -605,20 +697,33 @@ class SingleAgentController(Node):
                 f_rep_x += rep_mag * dx / safe_dist
                 f_rep_y += rep_mag * dy / safe_dist
 
-        f_obs_x, f_obs_y = self.obstacle_repulsion_force(self.current_x, self.current_y)
+        f_rep_x *= robot_scale
+        f_rep_y *= robot_scale
 
+        # Robot-obstacle repulsion
+        f_obs_x, f_obs_y = self.obstacle_repulsion_force(self.current_x, self.current_y)
+        f_obs_x *= obs_scale
+        f_obs_y *= obs_scale
+
+        # Total force
         total_fx = f_att_x + f_rep_x + f_obs_x
         total_fy = f_att_y + f_rep_y + f_obs_y
 
-        self.filtered_fx = (
-            (1.0 - self.force_filter_alpha) * self.filtered_fx
-            + self.force_filter_alpha * total_fx
-        )
-
-        self.filtered_fy = (
-            (1.0 - self.force_filter_alpha) * self.filtered_fy
-            + self.force_filter_alpha * total_fy
-        )
+        # Smooth force
+        if is_leader_at_goal and dist_to_my_target < 0.30:
+            # Near the goal, remove filter lag so the robot does not
+            # keep following an old curved force direction.
+            self.filtered_fx = total_fx
+            self.filtered_fy = total_fy
+        else:
+            self.filtered_fx = (
+                (1.0 - force_alpha) * self.filtered_fx
+                + force_alpha * total_fx
+            )
+            self.filtered_fy = (
+                (1.0 - force_alpha) * self.filtered_fy
+                + force_alpha * total_fy
+            )
 
         force_x = self.filtered_fx
         force_y = self.filtered_fy
@@ -630,8 +735,18 @@ class SingleAgentController(Node):
         force_msg.z = 0.0
         self.force_pub.publish(force_msg)
 
+        # ---------------------------------------------------------
+        # Final stop logic
+        # ---------------------------------------------------------
         if is_leader_at_goal:
-            if self.all_robots_settled() and dist_to_my_target < self.final_tol:
+        # Once this robot is close enough to its final target,
+        # stop completely instead of chasing tiny force/yaw noise.
+            if dist_to_my_target < self.final_tol:
+                self.stop_robot()
+                return
+
+        # Safety net: if the whole formation is settled, also stop.
+            if self.all_robots_settled():
                 self.stop_robot()
                 return
 
@@ -645,18 +760,25 @@ class SingleAgentController(Node):
         cmd = Twist()
 
         if force_norm < self.force_deadband:
-            self.cmd_pub.publish(cmd)
+            self.stop_robot()
             return
 
         target_yaw = math.atan2(force_y, force_x)
         yaw_error = wrap_angle(target_yaw - self.current_yaw)
 
-        w_raw = self.k_yaw * yaw_error
-        heading_factor = max(0.0, math.cos(yaw_error))
-        v_raw = force_norm * heading_factor
+        if is_leader_at_goal and dist_to_my_target < 0.30:
+            w_raw = 0.5 * self.k_yaw * yaw_error
+            v_raw = min(force_norm, current_max_speed)
+        else:
+            w_raw = self.k_yaw * yaw_error
+            heading_factor = max(0.0, math.cos(yaw_error))
+            v_raw = force_norm * heading_factor
 
+        # Softer rotate-in-place transition than before
         if abs(yaw_error) > self.rotate_in_place_angle:
-            v_raw = 0.0
+            excess = abs(yaw_error) - self.rotate_in_place_angle
+            fade = clamp(1.0 - excess / 0.8, 0.0, 1.0)
+            v_raw *= fade
 
         v_cmd, w_cmd = speed_cap(
             v_raw,
